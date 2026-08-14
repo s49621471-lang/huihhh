@@ -14,9 +14,11 @@ from java import jarray
 from java.lang import Integer, Object
 from java.lang.reflect import Array
 
+from org.telegram.tgnet import TLRPC
+
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from android_utils import log, run_on_ui_thread
-from client_utils import get_last_fragment
+from client_utils import get_last_fragment, get_messages_controller, send_request
 from hook_utils import get_private_field
 from ui.bulletin import BulletinHelper
 from ui.settings import Divider, Header, Input, Switch, Text
@@ -59,6 +61,26 @@ LIST_FIELDS = ("listView", "recyclerListView", "recyclerView")
 LOAD_ROUNDS = 40
 LOAD_PAUSE = 0.7
 LOAD_STALLS = 3
+
+DIALOG_FIELDS = ("dialog_id", "dialogId", "currentDialogId")
+
+
+def _filter_for_tab(tab):
+    """Фильтр messages.search, соответствующий вкладке общих медиа."""
+    try:
+        if tab == 0:
+            return TLRPC.TL_inputMessagesFilterPhotoVideo()
+        if tab == 2:
+            return TLRPC.TL_inputMessagesFilterVoice()
+        if tab == 3:
+            return TLRPC.TL_inputMessagesFilterUrl()
+        if tab == 4:
+            return TLRPC.TL_inputMessagesFilterMusic()
+        if tab == 5:
+            return TLRPC.TL_inputMessagesFilterGif()
+        return TLRPC.TL_inputMessagesFilterDocument()
+    except Exception:
+        return None
 
 
 def _parse_limit(raw, fallback=100):
@@ -253,6 +275,13 @@ class SelectAllPlugin(BasePlugin):
                 default=DEFAULT_LIMIT,
                 subtext="Штатный предел Telegram — 100. Больше можно, но клиент к этому не готов.",
                 icon="msg_limit_hit",
+            ),
+            Switch(
+                key="show_total",
+                text="Показывать, сколько всего и сколько останется",
+                default=True,
+                subtext="Общее число берётся с сервера, поэтому видно реальный остаток.",
+                icon="msg_info",
             ),
             Switch(
                 key="auto_load",
@@ -502,15 +531,105 @@ class SelectAllPlugin(BasePlugin):
 
         return messages
 
-    def _on_click(self, context=None):
-        threading.Thread(target=self._run, daemon=True).start()
+    # ------------------------------------------------------------------
+    # Сколько всего таких постов в канале
+    # ------------------------------------------------------------------
 
-    def _run(self):
+    def _dialog_id(self, layout, context):
+        for key in ("dialog_id", "dialogId"):
+            try:
+                value = (context or {}).get(key)
+            except Exception:
+                value = None
+            if value:
+                return int(value)
+
+        _, value = _first_field(layout, DIALOG_FIELDS)
+        if value:
+            try:
+                return int(value)
+            except Exception:
+                pass
+
+        try:
+            chat = (context or {}).get("chat")
+            if chat is not None:
+                chat_id = int(_call(chat, "getId") or get_private_field(chat, "id"))
+                return -(1000000000000 + chat_id) if chat_id > 0 else chat_id
+        except Exception:
+            pass
+        return None
+
+    def _total_in_channel(self, dialog_id, tab):
+        """Общее число постов такого типа — счётчик отдаёт сам сервер."""
+        if not dialog_id:
+            return None
+
+        media_filter = _filter_for_tab(tab)
+        if media_filter is None:
+            return None
+
+        try:
+            request = TLRPC.TL_messages_search()
+            request.peer = get_messages_controller().getInputPeer(dialog_id)
+            request.q = ""
+            request.filter = media_filter
+            request.min_date = 0
+            request.max_date = 0
+            request.offset_id = 0
+            request.add_offset = 0
+            request.limit = 1
+            request.max_id = 0
+            request.min_id = 0
+            for field in ("hash", "hash_"):
+                try:
+                    setattr(request, field, 0)
+                except Exception:
+                    pass
+        except Exception:
+            log("[select_all_files] запрос счётчика не собрался:\n" + traceback.format_exc())
+            return None
+
+        box = {}
+        event = threading.Event()
+
+        def callback(response, error):
+            box["response"] = response
+            box["error"] = error
+            event.set()
+
+        send_request(request, callback)
+        if not event.wait(20):
+            return None
+
+        response = box.get("response")
+        if response is None:
+            return None
+
+        count = getattr(response, "count", None)
+        if not count:
+            try:
+                count = len(list(response.messages))
+            except Exception:
+                count = None
+        try:
+            return int(count)
+        except Exception:
+            return None
+
+    def _on_click(self, context=None):
+        threading.Thread(target=self._run, args=(context,), daemon=True).start()
+
+    def _run(self, context=None):
         try:
             limit = _parse_limit(self.get_setting("limit", DEFAULT_LIMIT))
             layout = self._layout()
             tab = self._tab(layout)
             messages = self._messages(layout, tab)
+
+            total = None
+            if self.get_setting("show_total", True):
+                total = self._total_in_channel(self._dialog_id(layout, context), tab)
 
             if messages and len(messages) < limit and self.get_setting("auto_load", True):
                 BulletinHelper.show_info("Докручиваю список, подождите")
@@ -523,12 +642,12 @@ class SelectAllPlugin(BasePlugin):
                 return
 
             # Выделение трогает вьюхи клиента, поэтому только на UI-потоке.
-            run_on_ui_thread(lambda: self._select(layout, tab, messages, limit))
+            run_on_ui_thread(lambda: self._select(layout, tab, messages, limit, total))
         except Exception as exception:
             log("[select_all_files] ошибка подготовки:\n" + traceback.format_exc())
             BulletinHelper.show_error("Не вышло: %s" % exception)
 
-    def _select(self, layout, tab, messages, limit):
+    def _select(self, layout, tab, messages, limit, total=None):
         try:
             forced = bool(self.get_setting("force", False))
             selected = None
@@ -545,20 +664,22 @@ class SelectAllPlugin(BasePlugin):
                         "ушли в прямую запись" % entered
                     )
 
-            total = self._selected_count(layout)
+            marked = self._selected_count(layout) or selected
             log(
-                "[select_all_files] вкладка=%s загружено=%d выделено=%d всего=%d"
-                % (tab, len(messages), selected, total)
+                "[select_all_files] вкладка=%s загружено=%d выделено=%d отмечено=%d всего в канале=%s"
+                % (tab, len(messages), selected, marked, total)
             )
 
-            tail = ""
-            if len(messages) > limit:
-                tail = ", загружено %d — поднимите лимит в настройках" % len(messages)
+            if total:
+                left = max(total - marked, 0)
+                text = "Отмечено %d из %d · останется %d" % (marked, total, left)
+            else:
+                text = "Отмечено %d (загружено %d)" % (marked, len(messages))
 
-            BulletinHelper.show_success(
-                "Отмечено %d на вкладке «%s»%s"
-                % (total or selected, TAB_NAMES.get(tab, tab), tail)
-            )
+            if marked >= limit and (not total or total > marked):
+                text += " · лимит %d, повторите после удаления" % limit
+
+            BulletinHelper.show_success(text)
         except Exception as exception:
             log("[select_all_files] ошибка выделения:\n" + traceback.format_exc())
             BulletinHelper.show_error("Не вышло: %s" % exception)
