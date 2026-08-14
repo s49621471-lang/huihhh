@@ -50,6 +50,10 @@ MODE_DOCUMENTS = 0
 MODE_MEDIA = 1
 MODE_ANY = 2
 
+METHOD_AUTO = 0
+METHOD_SEARCH = 1
+METHOD_HISTORY = 2
+
 PAGE_LIMIT = 100
 DELETE_CHUNK = 100
 PAGE_DELAY = 0.25
@@ -336,6 +340,17 @@ class FilePostsCleanerPlugin(BasePlugin):
                 ],
                 icon="msg_media",
             ),
+            Selector(
+                key="scan_method",
+                text="Как обходить канал",
+                default=METHOD_AUTO,
+                items=[
+                    "Авто (поиск, при нуле — вся история)",
+                    "Только поиск по вкладке «Файлы»",
+                    "Всегда вся история (медленно, надёжно)",
+                ],
+                icon="msg_download",
+            ),
             Header(text="Безопасность"),
             Switch(
                 key="dry_run",
@@ -543,91 +558,177 @@ class FilePostsCleanerPlugin(BasePlugin):
                 pass
         return request
 
+    def _build_history(self, peer, offset_id):
+        request = TLRPC.TL_messages_getHistory()
+        request.peer = peer
+        request.offset_id = offset_id
+        request.offset_date = 0
+        request.add_offset = 0
+        request.limit = PAGE_LIMIT
+        request.max_id = 0
+        request.min_id = 0
+        for field in ("hash", "hash_"):
+            try:
+                setattr(request, field, 0)
+            except Exception:
+                pass
+        return request
+
     # ------------------------------------------------------------------
     # Сканирование
     # ------------------------------------------------------------------
+
+    def _walk(self, make_request, label, state):
+        """Постранично обходит канал и складывает подходящие посты в state."""
+        keep_ids = state["keep_ids"]
+        allowed_kinds = state["allowed_kinds"]
+        found = state["found"]
+        kept = state["kept"]
+        stats = state["stats"]
+
+        offset_id = 0
+        pages = 0
+
+        while pages < MAX_PAGES:
+            pages += 1
+            response, error = self._request_retrying(make_request(offset_id))
+            if error is not None:
+                stats["errors"].append("%s: %s" % (label, _error_text(error)))
+                return
+            if response is None:
+                stats["errors"].append("%s: пустой ответ" % label)
+                return
+
+            try:
+                messages = list(response.messages)
+            except Exception:
+                stats["errors"].append(
+                    "%s: неожиданный ответ %s" % (label, type(response).__name__)
+                )
+                return
+
+            if not messages:
+                return
+
+            stats["received"] += len(messages)
+            lowest = offset_id
+
+            for message in messages:
+                try:
+                    message_id = int(message.id)
+                except Exception:
+                    continue
+
+                if lowest == 0 or message_id < lowest:
+                    lowest = message_id
+
+                if message_id in found or message_id in kept:
+                    continue
+
+                info = _describe(message)
+                if info is None:
+                    stats["no_media"] += 1
+                    continue
+
+                kind, name, size = info
+                stats["kinds"][kind] = stats["kinds"].get(kind, 0) + 1
+
+                if allowed_kinds is not None and kind not in allowed_kinds:
+                    stats["wrong_kind"] += 1
+                    continue
+
+                entry = {
+                    "id": message_id,
+                    "kind": kind,
+                    "name": name,
+                    "size": size,
+                    "date": getattr(message, "date", 0),
+                    "text": _clean(getattr(message, "message", "")),
+                }
+
+                if message_id in keep_ids:
+                    kept[message_id] = entry
+                    continue
+
+                found[message_id] = entry
+
+            self._update_progress(
+                "Найдено: %d" % len(found),
+                "%s · просмотрено %d, дошли до #%d"
+                % (label, stats["received"], lowest),
+            )
+
+            if len(messages) < PAGE_LIMIT:
+                return
+            if lowest <= 1 or (offset_id > 0 and lowest >= offset_id):
+                return
+            offset_id = lowest
+            time.sleep(PAGE_DELAY)
+
+        stats["errors"].append("%s: достигнут предел в %d страниц" % (label, MAX_PAGES))
 
     def _scan_worker(self, dialog_id):
         try:
             keep_ids = _parse_ids(self.get_setting("keep_ids", DEFAULT_KEEP))
             mode = int(self.get_setting("scan_mode", MODE_DOCUMENTS) or 0)
+            method = int(self.get_setting("scan_method", METHOD_AUTO) or 0)
             filters, allowed_kinds = self._filters_for_mode(mode)
             peer = self._input_peer(dialog_id)
 
-            found = {}
-            kept = []
+            state = {
+                "keep_ids": keep_ids,
+                "allowed_kinds": allowed_kinds,
+                "found": {},
+                "kept": {},
+                "stats": {
+                    "received": 0,
+                    "no_media": 0,
+                    "wrong_kind": 0,
+                    "kinds": {},
+                    "errors": [],
+                    "source": "",
+                },
+            }
+            stats = state["stats"]
 
-            for media_filter in filters:
-                offset_id = 0
-                pages = 0
-                while pages < MAX_PAGES:
-                    pages += 1
-                    request = self._build_search(peer, media_filter, offset_id)
-                    response, error = self._request_retrying(request)
-                    if error is not None:
-                        raise RuntimeError("Ошибка поиска: %s" % _error_text(error))
-                    if response is None:
-                        break
-
-                    try:
-                        messages = list(response.messages)
-                    except Exception:
-                        messages = []
-
-                    if not messages:
-                        break
-
-                    lowest = offset_id
-                    for message in messages:
-                        try:
-                            message_id = int(message.id)
-                        except Exception:
-                            continue
-
-                        if lowest == 0 or message_id < lowest:
-                            lowest = message_id
-
-                        if message_id in found:
-                            continue
-
-                        info = _describe(message)
-                        if info is None:
-                            continue
-                        kind, name, size = info
-                        if allowed_kinds is not None and kind not in allowed_kinds:
-                            continue
-
-                        entry = {
-                            "id": message_id,
-                            "kind": kind,
-                            "name": name,
-                            "size": size,
-                            "date": getattr(message, "date", 0),
-                            "text": _clean(getattr(message, "message", "")),
-                        }
-
-                        if message_id in keep_ids:
-                            kept.append(entry)
-                            continue
-
-                        found[message_id] = entry
-
-                    self._update_progress(
-                        "Найдено: %d" % len(found),
-                        "Просмотрено сообщений до #%d" % lowest,
+            if method != METHOD_HISTORY:
+                stats["source"] = "поиск"
+                for media_filter in filters:
+                    self._walk(
+                        lambda offset_id, f=media_filter: self._build_search(peer, f, offset_id),
+                        "поиск",
+                        state,
                     )
 
-                    if len(messages) < PAGE_LIMIT:
-                        break
-                    if lowest <= 1 or lowest >= offset_id > 0:
-                        break
-                    offset_id = lowest
-                    time.sleep(PAGE_DELAY)
+            need_history = method == METHOD_HISTORY or (
+                method == METHOD_AUTO and not state["found"] and not state["kept"]
+            )
+            if need_history:
+                if stats["source"]:
+                    stats["source"] = "поиск → история"
+                else:
+                    stats["source"] = "история"
+                # При обходе истории сервер не фильтрует, отбираем сами.
+                state["allowed_kinds"] = (
+                    MEDIA_KINDS if mode == MODE_MEDIA else
+                    DOCUMENT_KINDS if mode == MODE_DOCUMENTS else None
+                )
+                self._walk(
+                    lambda offset_id: self._build_history(peer, offset_id),
+                    "история",
+                    state,
+                )
 
-            entries = sorted(found.values(), key=lambda item: item["id"])
+            entries = sorted(state["found"].values(), key=lambda item: item["id"])
+            kept = sorted(state["kept"].values(), key=lambda item: item["id"])
+            log(
+                "[file_posts_cleaner] итог: найдено=%d, просмотрено=%d, типы=%s, ошибки=%s"
+                % (len(entries), stats["received"], stats["kinds"], stats["errors"])
+            )
+
             self._dismiss_progress()
             run_on_ui_thread(
-                lambda: self._show_preview(dialog_id, entries, kept, keep_ids)
+                lambda: self._show_preview(dialog_id, entries, kept, keep_ids, stats)
             )
         except Exception as exception:
             log("[file_posts_cleaner] scan failed:\n" + traceback.format_exc())
@@ -650,8 +751,26 @@ class FilePostsCleanerPlugin(BasePlugin):
             (" · «%s»" % entry["text"]) if entry["text"] else "",
         )
 
-    def _show_preview(self, dialog_id, entries, kept, keep_ids):
+    def _diagnostics(self, stats):
+        lines = [
+            "Способ обхода: %s" % (stats.get("source") or "—"),
+            "Сообщений получено от сервера: %d" % stats.get("received", 0),
+            "Из них без вложений: %d" % stats.get("no_media", 0),
+            "Отсеяно по типу вложения: %d" % stats.get("wrong_kind", 0),
+        ]
+        kinds = stats.get("kinds") or {}
+        if kinds:
+            lines.append(
+                "Найденные типы: %s"
+                % ", ".join("%s×%d" % (key, value) for key, value in sorted(kinds.items()))
+            )
+        for error in stats.get("errors") or []:
+            lines.append("⚠️ %s" % error)
+        return "\n".join(lines)
+
+    def _show_preview(self, dialog_id, entries, kept, keep_ids, stats=None):
         self._busy = False
+        stats = stats or {}
 
         if self.get_setting("save_report", True) and entries:
             threading.Thread(
@@ -670,10 +789,17 @@ class FilePostsCleanerPlugin(BasePlugin):
             builder = AlertDialogBuilder(activity)
             builder.set_title("Ничего не найдено")
             builder.set_message(
-                "Постов с вложениями по текущим настройкам нет.\n\n"
-                "Проверьте режим поиска в настройках плагина."
+                "Постов с вложениями по текущим настройкам нет.\n\n%s\n\n"
+                "Если файлы в канале точно есть — поставьте «Как обходить канал» → "
+                "«Всегда вся история» и запустите снова."
+                % self._diagnostics(stats)
             )
             builder.set_positive_button("Ок", lambda b, w: b.dismiss())
+            builder.set_negative_button(
+                "Обойти всю историю",
+                lambda b, w: (b.dismiss(), self._force_history(dialog_id)),
+            )
+            builder.create()
             builder.show()
             return
 
@@ -682,9 +808,11 @@ class FilePostsCleanerPlugin(BasePlugin):
             lines.append("…и ещё %d постов" % (len(entries) - PREVIEW_LINES))
 
         total_size = sum(entry["size"] or 0 for entry in entries)
-        header = "Будет удалено постов: %d\nОбщий объём: %s\n\n" % (
+        header = "Будет удалено постов: %d\nОбщий объём: %s\nПросмотрено сообщений: %d (%s)\n\n" % (
             len(entries),
             _human_size(total_size),
+            stats.get("received", 0),
+            stats.get("source") or "—",
         )
 
         footer = ""
@@ -731,6 +859,11 @@ class FilePostsCleanerPlugin(BasePlugin):
                 builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
             except Exception:
                 pass
+
+    def _force_history(self, dialog_id):
+        self.set_setting("scan_method", METHOD_HISTORY, reload_settings=True)
+        BulletinHelper.show_info("Обхожу всю историю канала, это дольше")
+        self._start(dialog_id)
 
     def _disable_dry_run(self, builder):
         builder.dismiss()
