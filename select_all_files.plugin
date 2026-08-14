@@ -10,6 +10,7 @@ import traceback
 
 from java import jarray
 from java.lang import Integer, Object
+from java.lang.reflect import Array
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from android_utils import log, run_on_ui_thread
@@ -100,6 +101,92 @@ def _invoke(method, target, arguments):
         for index, value in enumerate(arguments):
             boxed[index] = value
         return method.invoke(target, boxed)
+
+
+def _class_name(value):
+    try:
+        return str(value.getClass().getName())
+    except Exception:
+        return type(value).__name__
+
+
+def _array_get(java_array, index):
+    """Элемент Java-массива, полученного рефлексией (его статический тип — Object)."""
+    try:
+        return java_array[index]
+    except Exception:
+        pass
+    try:
+        return Array.get(java_array, index)
+    except Exception:
+        return None
+
+
+def _call(java_object, name, arguments=()):
+    """Вызов метода: сначала напрямую, иначе через рефлексию по реальному классу."""
+    if java_object is None:
+        return None
+    try:
+        return getattr(java_object, name)(*arguments)
+    except Exception:
+        pass
+    method = _find_method(java_object, name, len(arguments))
+    if method is None:
+        return None
+    try:
+        return _invoke(method, java_object, list(arguments))
+    except Exception:
+        return None
+
+
+def _as_list(value):
+    """Читает java.util.List, даже если рефлексия вернула его как Object."""
+    if value is None:
+        return None
+
+    try:
+        return list(value)
+    except Exception:
+        pass
+
+    size_method = _find_method(value, "size", 0)
+    get_method = _find_method(value, "get", 1)
+    if size_method is None or get_method is None:
+        return None
+
+    try:
+        count = int(_invoke(size_method, value, []))
+    except Exception:
+        return None
+
+    items = []
+    for index in range(count):
+        try:
+            items.append(_invoke(get_method, value, [Integer(int(index))]))
+        except Exception:
+            continue
+    return items
+
+
+def _sparse_size(sparse):
+    method = _find_method(sparse, "size", 0)
+    if method is None:
+        return 0
+    try:
+        return int(_invoke(method, sparse, []))
+    except Exception:
+        return 0
+
+
+def _sparse_put(sparse, key, value):
+    method = _find_method(sparse, "put", 2)
+    if method is None:
+        return False
+    try:
+        _invoke(method, sparse, [Integer(int(key)), value])
+        return True
+    except Exception:
+        return False
 
 
 def _first_field(java_object, names):
@@ -225,10 +312,7 @@ class SelectAllPlugin(BasePlugin):
         if data is None:
             raise RuntimeError("не нашёл список медиа в этом окне")
 
-        try:
-            bucket = data[tab]
-        except Exception:
-            bucket = None
+        bucket = _array_get(data, tab)
         if bucket is None:
             raise RuntimeError("вкладка «%s» ещё не загружена" % TAB_NAMES.get(tab, tab))
 
@@ -244,10 +328,16 @@ class SelectAllPlugin(BasePlugin):
         if messages is None:
             raise RuntimeError("не нашёл сообщения вкладки «%s»" % TAB_NAMES.get(tab, tab))
 
-        try:
-            return list(messages)
-        except Exception:
-            raise RuntimeError("список сообщений не читается")
+        items = _as_list(messages)
+        if items is None:
+            raise RuntimeError(
+                "список сообщений не читается (%s)" % _class_name(messages)
+            )
+        log(
+            "[select_all_files] вкладка %s: поле %s, список %s, элементов %d"
+            % (tab, name, _class_name(messages), len(items))
+        )
+        return items
 
     def _selected_count(self, layout):
         selected = get_private_field(layout, "selectedFiles")
@@ -255,10 +345,10 @@ class SelectAllPlugin(BasePlugin):
             return 0
         total = 0
         for index in (0, 1):
-            try:
-                total += int(selected[index].size())
-            except Exception:
+            bucket = _array_get(selected, index)
+            if bucket is None:
                 continue
+            total += _sparse_size(bucket)
         return total
 
     # ------------------------------------------------------------------
@@ -310,14 +400,23 @@ class SelectAllPlugin(BasePlugin):
         if selected is None:
             raise RuntimeError("не нашёл список выделенного (selectedFiles)")
 
-        bucket = selected[0]
+        bucket = _array_get(selected, 0)
+        if bucket is None:
+            raise RuntimeError(
+                "не читается selectedFiles (%s)" % _class_name(selected)
+            )
+
         added = 0
         for message in messages[:limit]:
+            message_id = _call(message, "getId")
+            if message_id is None:
+                continue
             try:
-                bucket.put(int(message.getId()), message)
-                added += 1
+                message_id = int(message_id)
             except Exception:
                 continue
+            if _sparse_put(bucket, message_id, message):
+                added += 1
 
         self._refresh(layout)
         return added
@@ -330,14 +429,8 @@ class SelectAllPlugin(BasePlugin):
                 adapter = None
             if adapter is None:
                 continue
-            try:
-                adapter.notifyDataSetChanged()
-            except Exception:
-                continue
-        try:
-            layout.invalidate()
-        except Exception:
-            pass
+            _call(adapter, "notifyDataSetChanged")
+        _call(layout, "invalidate")
 
     def _on_click(self, context=None):
         run_on_ui_thread(self._run)
