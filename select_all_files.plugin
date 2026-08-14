@@ -1,0 +1,391 @@
+"""
+Выделить все — плагин для exteraGram.
+
+Добавляет в меню профиля канала пункт, который отмечает сразу все загруженные
+элементы открытой вкладки общих медиа («Файлы», «Медиа», «Музыка» и т.д.),
+чтобы дальше удалить их штатной корзиной Telegram.
+"""
+
+import traceback
+
+from java import jarray
+from java.lang import Integer, Object
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from android_utils import log, run_on_ui_thread
+from client_utils import get_last_fragment
+from hook_utils import get_private_field
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Switch, Text
+
+__id__ = "select_all_files"
+__name__ = "Выделить все"
+__description__ = (
+    "Пункт «Выделить все» в меню канала: отмечает все загруженные элементы "
+    "открытой вкладки общих медиа, чтобы удалить их штатной корзиной."
+)
+__author__ = "ENI"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+
+DEFAULT_LIMIT = "100"
+
+# Индексы вкладок SharedMediaLayout в клиенте Telegram.
+TAB_NAMES = {
+    0: "Медиа",
+    1: "Файлы",
+    2: "Голосовые",
+    3: "Ссылки",
+    4: "Музыка",
+    5: "GIF",
+}
+
+LAYOUT_FIELDS = ("sharedMediaLayout", "mediaLayout", "sharedMediaLayoutView")
+DATA_FIELDS = ("sharedMediaData",)
+ADAPTER_FIELDS = (
+    "documentsAdapter",
+    "photoVideoAdapter",
+    "audioAdapter",
+    "voiceAdapter",
+    "linksAdapter",
+    "gifAdapter",
+)
+
+
+def _parse_limit(raw, fallback=100):
+    try:
+        value = int(str(raw).strip())
+    except Exception:
+        return fallback
+    if value < 1:
+        return fallback
+    return value
+
+
+def _find_method(java_object, name, argc):
+    """Ищет метод по имени и числу аргументов, поднимаясь по иерархии классов."""
+    try:
+        clazz = java_object.getClass()
+    except Exception:
+        return None
+
+    while clazz is not None:
+        try:
+            methods = clazz.getDeclaredMethods()
+        except Exception:
+            methods = []
+        for method in methods:
+            try:
+                if method.getName() != name:
+                    continue
+                if len(method.getParameterTypes()) != argc:
+                    continue
+                method.setAccessible(True)
+                return method
+            except Exception:
+                continue
+        try:
+            clazz = clazz.getSuperclass()
+        except Exception:
+            return None
+    return None
+
+
+def _invoke(method, target, arguments):
+    """Method.invoke с varargs, с запасным вариантом через явный jarray."""
+    try:
+        return method.invoke(target, *arguments)
+    except TypeError:
+        boxed = jarray(Object)(len(arguments))
+        for index, value in enumerate(arguments):
+            boxed[index] = value
+        return method.invoke(target, boxed)
+
+
+def _first_field(java_object, names):
+    for name in names:
+        try:
+            value = get_private_field(java_object, name)
+        except Exception:
+            value = None
+        if value is not None:
+            return name, value
+    return None, None
+
+
+class SelectAllPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._items = []
+        for menu_type in (
+            MenuItemType.PROFILE_ACTION_MENU,
+            MenuItemType.CHAT_ACTION_MENU,
+        ):
+            try:
+                item_id = self.add_menu_item(
+                    MenuItemData(
+                        menu_type=menu_type,
+                        text="Выделить все",
+                        icon="msg_select",
+                        subtext="Отметить всё на открытой вкладке",
+                        on_click=self._on_click,
+                        priority=6,
+                    )
+                )
+                if item_id:
+                    self._items.append(item_id)
+            except Exception:
+                log("[select_all_files] меню не добавлено:\n" + traceback.format_exc())
+        self.log("плагин загружен")
+
+    def on_plugin_unload(self):
+        for item_id in self._items:
+            try:
+                self.remove_menu_item(item_id)
+            except Exception:
+                pass
+        self._items = []
+
+    # ------------------------------------------------------------------
+    # Настройки
+    # ------------------------------------------------------------------
+
+    def create_settings(self):
+        return [
+            Header(text="Выделение"),
+            Input(
+                key="limit",
+                text="Максимум за раз",
+                default=DEFAULT_LIMIT,
+                subtext="Штатный предел Telegram — 100. Больше можно, но клиент к этому не готов.",
+                icon="msg_limit_hit",
+            ),
+            Switch(
+                key="force",
+                text="Обходить проверки клиента",
+                default=False,
+                subtext=(
+                    "Писать выделение напрямую, минуя ограничения. Нужно, если обычный "
+                    "способ не сработал: зажмите любой файл, потом жмите «Выделить все»."
+                ),
+                icon="msg_warning",
+            ),
+            Divider(),
+            Text(
+                text="Выделить все на открытой вкладке",
+                icon="msg_select",
+                accent=True,
+                on_click=lambda view=None: self._on_click({}),
+            ),
+            Divider(
+                text=(
+                    "Откройте канал → вкладку «Файлы», прокрутите список настолько, "
+                    "насколько хотите выделить, и нажмите «Выделить все». Отмечаются "
+                    "только подгруженные элементы: докрутите ниже и повторите."
+                )
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Поиск нужных объектов в клиенте
+    # ------------------------------------------------------------------
+
+    def _layout(self):
+        fragment = get_last_fragment()
+        if fragment is None:
+            raise RuntimeError("нет открытого экрана")
+
+        name, layout = _first_field(fragment, LAYOUT_FIELDS)
+        if layout is None:
+            raise RuntimeError(
+                "на этом экране нет общих медиа — откройте профиль канала и вкладку «Файлы»"
+            )
+        log("[select_all_files] layout найден в поле %s" % name)
+        return layout
+
+    def _tab(self, layout):
+        for method_name in ("getSelectedTab", "getClosestTab"):
+            method = _find_method(layout, method_name, 0)
+            if method is None:
+                continue
+            try:
+                return int(_invoke(method, layout, []))
+            except Exception:
+                continue
+
+        value = get_private_field(layout, "selectedTab")
+        if value is not None:
+            try:
+                return int(value)
+            except Exception:
+                pass
+        return 1
+
+    def _messages(self, layout, tab):
+        name, data = _first_field(layout, DATA_FIELDS)
+        if data is None:
+            raise RuntimeError("не нашёл список медиа в этом окне")
+
+        try:
+            bucket = data[tab]
+        except Exception:
+            bucket = None
+        if bucket is None:
+            raise RuntimeError("вкладка «%s» ещё не загружена" % TAB_NAMES.get(tab, tab))
+
+        messages = None
+        for field in ("messages", "messagesList"):
+            try:
+                messages = get_private_field(bucket, field)
+            except Exception:
+                messages = None
+            if messages is not None:
+                break
+
+        if messages is None:
+            raise RuntimeError("не нашёл сообщения вкладки «%s»" % TAB_NAMES.get(tab, tab))
+
+        try:
+            return list(messages)
+        except Exception:
+            raise RuntimeError("список сообщений не читается")
+
+    def _selected_count(self, layout):
+        selected = get_private_field(layout, "selectedFiles")
+        if selected is None:
+            return 0
+        total = 0
+        for index in (0, 1):
+            try:
+                total += int(selected[index].size())
+            except Exception:
+                continue
+        return total
+
+    # ------------------------------------------------------------------
+    # Само выделение
+    # ------------------------------------------------------------------
+
+    def _enter_selection(self, layout, tab, messages):
+        """Включает штатный режим выделения длинным нажатием по первому элементу."""
+        long_click = _find_method(layout, "onItemLongClick", 3)
+        if long_click is None:
+            return False
+        before = self._selected_count(layout)
+        try:
+            _invoke(long_click, layout, [messages[0], None, Integer(int(tab))])
+        except Exception:
+            log("[select_all_files] onItemLongClick упал:\n" + traceback.format_exc())
+            return False
+        return self._selected_count(layout) > before
+
+    def _select_standard(self, layout, tab, messages, limit):
+        """Штатный путь: клики по элементам после включённого режима выделения."""
+        item_click = _find_method(layout, "onItemClick", 5)
+        if item_click is None:
+            return None
+
+        selected = 1
+        for index in range(1, min(len(messages), limit)):
+            try:
+                _invoke(
+                    item_click,
+                    layout,
+                    [
+                        Integer(int(index)),
+                        None,
+                        messages[index],
+                        Integer(int(tab)),
+                        Integer(int(tab)),
+                    ],
+                )
+                selected += 1
+            except Exception:
+                log("[select_all_files] пропуск элемента %d:\n%s" % (index, traceback.format_exc()))
+
+        return selected
+
+    def _select_forced(self, layout, messages, limit):
+        """Запасной путь: запись прямо в selectedFiles, режим выделения уже должен быть включён."""
+        selected = get_private_field(layout, "selectedFiles")
+        if selected is None:
+            raise RuntimeError("не нашёл список выделенного (selectedFiles)")
+
+        bucket = selected[0]
+        added = 0
+        for message in messages[:limit]:
+            try:
+                bucket.put(int(message.getId()), message)
+                added += 1
+            except Exception:
+                continue
+
+        self._refresh(layout)
+        return added
+
+    def _refresh(self, layout):
+        for field in ADAPTER_FIELDS:
+            try:
+                adapter = get_private_field(layout, field)
+            except Exception:
+                adapter = None
+            if adapter is None:
+                continue
+            try:
+                adapter.notifyDataSetChanged()
+            except Exception:
+                continue
+        try:
+            layout.invalidate()
+        except Exception:
+            pass
+
+    def _on_click(self, context=None):
+        run_on_ui_thread(self._run)
+
+    def _run(self):
+        try:
+            limit = _parse_limit(self.get_setting("limit", DEFAULT_LIMIT))
+            layout = self._layout()
+            tab = self._tab(layout)
+            messages = self._messages(layout, tab)
+
+            if not messages:
+                BulletinHelper.show_error(
+                    "На вкладке «%s» пока ничего не загружено" % TAB_NAMES.get(tab, tab)
+                )
+                return
+
+            forced = bool(self.get_setting("force", False))
+            selected = None
+            entered = self._enter_selection(layout, tab, messages)
+
+            if not forced and entered:
+                selected = self._select_standard(layout, tab, messages, limit)
+
+            if selected is None:
+                selected = self._select_forced(layout, messages, limit)
+                if not forced:
+                    log(
+                        "[select_all_files] штатный путь не сработал (режим выделения: %s), "
+                        "ушли в прямую запись" % entered
+                    )
+
+            total = self._selected_count(layout)
+            log(
+                "[select_all_files] вкладка=%s загружено=%d выделено=%d всего=%d"
+                % (tab, len(messages), selected, total)
+            )
+
+            tail = ""
+            if len(messages) > limit:
+                tail = ", загружено %d — поднимите лимит или повторите" % len(messages)
+            elif len(messages) >= 40:
+                tail = ", прокрутите ниже и нажмите ещё раз"
+
+            BulletinHelper.show_success(
+                "Отмечено %d на вкладке «%s»%s"
+                % (total or selected, TAB_NAMES.get(tab, tab), tail)
+            )
+        except Exception as exception:
+            log("[select_all_files] ошибка:\n" + traceback.format_exc())
+            BulletinHelper.show_error("Не вышло: %s" % exception)
