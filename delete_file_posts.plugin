@@ -1,0 +1,872 @@
+"""
+Чистка постов с файлами — плагин для exteraGram.
+
+Находит в выбранном канале посты с вложениями, ПОКАЗЫВАЕТ список того, что
+будет удалено, и удаляет только после явного подтверждения. Посты из белого
+списка (по умолчанию — 44) не трогаются никогда.
+"""
+
+import re
+import threading
+import time
+import traceback
+
+from java.lang import Integer
+
+from org.telegram.tgnet import TLRPC
+
+from base_plugin import BasePlugin, MenuItemData, MenuItemType
+from android_utils import log, run_on_ui_thread
+from client_utils import (
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    send_request,
+    send_text,
+)
+from ui.alert import AlertDialogBuilder
+from ui.bulletin import BulletinHelper
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
+
+__id__ = "file_posts_cleaner"
+__name__ = "Чистка постов с файлами"
+__description__ = (
+    "Удаляет в выбранном канале посты с файлами. Сначала показывает полный "
+    "список того, что будет удалено, и требует подтверждения. Посты из белого "
+    "списка не удаляются."
+)
+__author__ = "ENI"
+__version__ = "1.0.0"
+__icon__ = "exteraPlugins/1"
+
+# ---------------------------------------------------------------------------
+# Значения по умолчанию
+# ---------------------------------------------------------------------------
+
+DEFAULT_CHAT = "-1002053026588"
+DEFAULT_KEEP = "44"
+
+MODE_DOCUMENTS = 0
+MODE_MEDIA = 1
+MODE_ANY = 2
+
+PAGE_LIMIT = 100
+DELETE_CHUNK = 100
+PAGE_DELAY = 0.25
+CHUNK_DELAY = 0.35
+MAX_PAGES = 500
+REQUEST_TIMEOUT = 45.0
+PREVIEW_LINES = 25
+REPORT_CHUNK = 3800
+
+
+# ---------------------------------------------------------------------------
+# Мелкие утилиты
+# ---------------------------------------------------------------------------
+
+
+def _human_size(size):
+    try:
+        size = int(size)
+    except Exception:
+        return "?"
+    if size < 1024:
+        return "%d Б" % size
+    for unit in ("КБ", "МБ", "ГБ", "ТБ"):
+        size /= 1024.0
+        if size < 1024:
+            return "%.1f %s" % (size, unit)
+    return "%.1f ПБ" % size
+
+
+def _fmt_date(ts):
+    try:
+        return time.strftime("%d.%m.%Y %H:%M", time.localtime(int(ts)))
+    except Exception:
+        return "??.??.????"
+
+
+def _clean(text, limit=48):
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", str(text)).strip()
+    if len(text) > limit:
+        text = text[: limit - 1] + "…"
+    return text
+
+
+def _parse_ids(raw):
+    """Принимает '44', '44, 45', ссылки t.me/c/.../44 — возвращает set(int)."""
+    result = set()
+    if not raw:
+        return result
+    for token in re.split(r"[\s,;]+", str(raw)):
+        if not token:
+            continue
+        numbers = re.findall(r"\d+", token)
+        if not numbers:
+            continue
+        # Для ссылки вида t.me/c/2053026588/44 нужен последний сегмент.
+        try:
+            result.add(int(numbers[-1]))
+        except Exception:
+            continue
+    return result
+
+
+def _parse_chat_id(raw):
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    numbers = re.findall(r"-?\d+", text)
+    if not numbers:
+        return None
+    try:
+        value = int(numbers[0])
+    except Exception:
+        return None
+    return value
+
+
+def _normalize_dialog(chat_id):
+    """Приводит 2053026588 / -1002053026588 / -100... к диалоговому id."""
+    if chat_id is None:
+        return None
+    if chat_id < 0:
+        return chat_id
+    if chat_id > 1000000000000:
+        return -chat_id
+    return -(1000000000000 + chat_id)
+
+
+def _flood_wait_seconds(error):
+    try:
+        text = getattr(error, "text", None) or str(error)
+    except Exception:
+        return 0
+    match = re.search(r"FLOOD_WAIT_(\d+)", text or "")
+    if match:
+        return int(match.group(1))
+    return 0
+
+
+def _error_text(error):
+    if error is None:
+        return "неизвестная ошибка"
+    try:
+        return getattr(error, "text", None) or str(error)
+    except Exception:
+        return "неизвестная ошибка"
+
+
+# ---------------------------------------------------------------------------
+# Разбор медиа
+# ---------------------------------------------------------------------------
+
+
+def _document_info(doc):
+    """Возвращает (kind, name, size) для TLRPC.Document."""
+    name = None
+    kind = "file"
+    try:
+        attributes = doc.attributes
+    except Exception:
+        attributes = None
+
+    if attributes is not None:
+        for attr in attributes:
+            if isinstance(attr, TLRPC.TL_documentAttributeFilename):
+                name = attr.file_name
+            elif isinstance(attr, TLRPC.TL_documentAttributeVideo):
+                kind = "video"
+            elif isinstance(attr, TLRPC.TL_documentAttributeAudio):
+                kind = "voice" if getattr(attr, "voice", False) else "audio"
+            elif isinstance(attr, TLRPC.TL_documentAttributeAnimated):
+                kind = "gif"
+            elif isinstance(attr, TLRPC.TL_documentAttributeSticker):
+                kind = "sticker"
+
+    if not name:
+        try:
+            name = str(doc.mime_type or "документ")
+        except Exception:
+            name = "документ"
+
+    try:
+        size = doc.size
+    except Exception:
+        size = 0
+
+    return kind, name, size
+
+
+def _describe(message):
+    """(kind, name, size) или None, если во вложении нет файла."""
+    media = getattr(message, "media", None)
+    if media is None:
+        return None
+    if isinstance(media, TLRPC.TL_messageMediaWebPage):
+        return None
+    if isinstance(media, TLRPC.TL_messageMediaEmpty):
+        return None
+
+    if isinstance(media, TLRPC.TL_messageMediaDocument):
+        doc = getattr(media, "document", None)
+        if doc is None:
+            return None
+        return _document_info(doc)
+
+    if isinstance(media, TLRPC.TL_messageMediaPhoto):
+        size = 0
+        try:
+            sizes = media.photo.sizes
+            for item in sizes:
+                current = getattr(item, "size", 0) or 0
+                if current > size:
+                    size = current
+        except Exception:
+            size = 0
+        return "photo", "фото", size
+
+    # Опросы, геометки, контакты и прочее файлами не считаем.
+    return None
+
+
+KIND_ICON = {
+    "file": "📄",
+    "video": "🎬",
+    "audio": "🎵",
+    "voice": "🎤",
+    "gif": "🌀",
+    "sticker": "🩹",
+    "photo": "🖼",
+}
+
+DOCUMENT_KINDS = ("file", "sticker")
+MEDIA_KINDS = ("file", "video", "audio", "voice", "gif", "sticker")
+
+
+# ---------------------------------------------------------------------------
+# Плагин
+# ---------------------------------------------------------------------------
+
+
+class FilePostsCleanerPlugin(BasePlugin):
+    def on_plugin_load(self):
+        self._busy = False
+        self._dialog = None
+        self._menu_id = None
+        try:
+            self._menu_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.CHAT_ACTION_MENU,
+                    text="Чистка постов с файлами",
+                    icon="msg_delete",
+                    subtext="Показать, что будет удалено",
+                    on_click=self._on_menu_click,
+                    priority=5,
+                )
+            )
+        except Exception:
+            log("[file_posts_cleaner] не удалось добавить пункт меню:\n" + traceback.format_exc())
+        self.log("плагин загружен")
+
+    def on_plugin_unload(self):
+        if self._menu_id:
+            try:
+                self.remove_menu_item(self._menu_id)
+            except Exception:
+                pass
+        self._menu_id = None
+        self.log("плагин выгружен")
+
+    # ------------------------------------------------------------------
+    # Настройки
+    # ------------------------------------------------------------------
+
+    def create_settings(self):
+        return [
+            Header(text="Канал"),
+            Input(
+                key="allowed_chat",
+                text="ID канала",
+                default=DEFAULT_CHAT,
+                subtext="Плагин работает только с этим каналом. Пусто — разрешён любой открытый чат.",
+                icon="msg_channel",
+            ),
+            Input(
+                key="keep_ids",
+                text="Не удалять посты",
+                default=DEFAULT_KEEP,
+                subtext="ID через запятую. Можно вставлять ссылки вида t.me/c/2053026588/44.",
+                icon="msg_pin",
+            ),
+            Header(text="Что считать файлом"),
+            Selector(
+                key="scan_mode",
+                text="Режим поиска",
+                default=MODE_DOCUMENTS,
+                items=[
+                    "Только файлы (документы)",
+                    "Файлы, видео, аудио, GIF",
+                    "Любые вложения (в т.ч. фото)",
+                ],
+                icon="msg_media",
+            ),
+            Header(text="Безопасность"),
+            Switch(
+                key="dry_run",
+                text="Только просмотр",
+                default=True,
+                subtext="Пока включено — кнопки удаления в окне не будет вообще.",
+                icon="msg_view_file",
+            ),
+            Switch(
+                key="confirm_twice",
+                text="Двойное подтверждение",
+                default=True,
+                subtext="Перед удалением спросить ещё раз.",
+                icon="msg_info",
+            ),
+            Switch(
+                key="save_report",
+                text="Список в «Избранное»",
+                default=True,
+                subtext="Полный перечень найденных постов уходит в Saved Messages.",
+                icon="msg_saved",
+            ),
+            Divider(),
+            Text(
+                text="Показать, что будет удалено",
+                icon="msg_search",
+                accent=True,
+                on_click=self._on_settings_scan_click,
+            ),
+            Divider(
+                text=(
+                    "Порядок работы: сканирование → список найденного → подтверждение → "
+                    "удаление. Пока включён режим «Только просмотр», удалить ничего нельзя."
+                )
+            ),
+        ]
+
+    # ------------------------------------------------------------------
+    # Точки входа
+    # ------------------------------------------------------------------
+
+    def _on_settings_scan_click(self, view=None):
+        dialog_id = _normalize_dialog(_parse_chat_id(self.get_setting("allowed_chat", DEFAULT_CHAT)))
+        if dialog_id is None:
+            BulletinHelper.show_error("Укажите ID канала в настройках плагина")
+            return
+        self._start(dialog_id)
+
+    def _on_menu_click(self, context):
+        dialog_id = None
+        try:
+            dialog_id = context.get("dialog_id")
+        except Exception:
+            dialog_id = None
+
+        if not dialog_id:
+            chat = None
+            try:
+                chat = context.get("chat")
+            except Exception:
+                chat = None
+            if chat is not None:
+                dialog_id = _normalize_dialog(int(chat.id))
+
+        if not dialog_id:
+            BulletinHelper.show_error("Не удалось определить чат")
+            return
+
+        self._start(int(dialog_id))
+
+    def _start(self, dialog_id):
+        if self._busy:
+            BulletinHelper.show_info("Уже идёт сканирование")
+            return
+
+        allowed_raw = self.get_setting("allowed_chat", DEFAULT_CHAT)
+        allowed_id = _normalize_dialog(_parse_chat_id(allowed_raw))
+        if allowed_id is not None and allowed_id != dialog_id:
+            BulletinHelper.show_error(
+                "Этот чат не разрешён. В настройках указан %s" % allowed_id
+            )
+            return
+
+        if dialog_id >= 0:
+            BulletinHelper.show_error("Плагин работает только с каналами и группами")
+            return
+
+        self._busy = True
+        self._show_progress("Ищу посты с файлами…", "Это может занять время")
+        threading.Thread(
+            target=self._scan_worker, args=(dialog_id,), daemon=True
+        ).start()
+
+    # ------------------------------------------------------------------
+    # Запросы
+    # ------------------------------------------------------------------
+
+    def _request(self, request, timeout=REQUEST_TIMEOUT):
+        box = {}
+        event = threading.Event()
+
+        def callback(response, error):
+            box["response"] = response
+            box["error"] = error
+            event.set()
+
+        send_request(request, callback)
+        if not event.wait(timeout):
+            raise RuntimeError("Telegram не ответил за %d с" % int(timeout))
+        return box.get("response"), box.get("error")
+
+    def _request_retrying(self, request, attempts=3):
+        last_error = None
+        for _ in range(attempts):
+            response, error = self._request(request)
+            if error is None:
+                return response, None
+            wait = _flood_wait_seconds(error)
+            last_error = error
+            if wait <= 0:
+                return None, error
+            if wait > 300:
+                return None, error
+            time.sleep(wait + 1)
+        return None, last_error
+
+    def _input_peer(self, dialog_id):
+        peer = get_messages_controller().getInputPeer(dialog_id)
+        if peer is None:
+            raise RuntimeError("Не удалось получить доступ к чату — откройте его в приложении")
+        return peer
+
+    def _filters_for_mode(self, mode):
+        if mode == MODE_DOCUMENTS:
+            return [TLRPC.TL_inputMessagesFilterDocument()], DOCUMENT_KINDS
+        if mode == MODE_MEDIA:
+            return (
+                [
+                    TLRPC.TL_inputMessagesFilterDocument(),
+                    TLRPC.TL_inputMessagesFilterVideo(),
+                    TLRPC.TL_inputMessagesFilterMusic(),
+                    TLRPC.TL_inputMessagesFilterVoice(),
+                    TLRPC.TL_inputMessagesFilterGif(),
+                ],
+                MEDIA_KINDS,
+            )
+        return [TLRPC.TL_inputMessagesFilterEmpty()], None
+
+    def _build_search(self, peer, media_filter, offset_id):
+        request = TLRPC.TL_messages_search()
+        request.peer = peer
+        request.q = ""
+        request.filter = media_filter
+        request.min_date = 0
+        request.max_date = 0
+        request.offset_id = offset_id
+        request.add_offset = 0
+        request.limit = PAGE_LIMIT
+        request.max_id = 0
+        request.min_id = 0
+        for field in ("hash", "hash_"):
+            try:
+                setattr(request, field, 0)
+            except Exception:
+                pass
+        return request
+
+    # ------------------------------------------------------------------
+    # Сканирование
+    # ------------------------------------------------------------------
+
+    def _scan_worker(self, dialog_id):
+        try:
+            keep_ids = _parse_ids(self.get_setting("keep_ids", DEFAULT_KEEP))
+            mode = int(self.get_setting("scan_mode", MODE_DOCUMENTS) or 0)
+            filters, allowed_kinds = self._filters_for_mode(mode)
+            peer = self._input_peer(dialog_id)
+
+            found = {}
+            kept = []
+
+            for media_filter in filters:
+                offset_id = 0
+                pages = 0
+                while pages < MAX_PAGES:
+                    pages += 1
+                    request = self._build_search(peer, media_filter, offset_id)
+                    response, error = self._request_retrying(request)
+                    if error is not None:
+                        raise RuntimeError("Ошибка поиска: %s" % _error_text(error))
+                    if response is None:
+                        break
+
+                    try:
+                        messages = list(response.messages)
+                    except Exception:
+                        messages = []
+
+                    if not messages:
+                        break
+
+                    lowest = offset_id
+                    for message in messages:
+                        try:
+                            message_id = int(message.id)
+                        except Exception:
+                            continue
+
+                        if lowest == 0 or message_id < lowest:
+                            lowest = message_id
+
+                        if message_id in found:
+                            continue
+
+                        info = _describe(message)
+                        if info is None:
+                            continue
+                        kind, name, size = info
+                        if allowed_kinds is not None and kind not in allowed_kinds:
+                            continue
+
+                        entry = {
+                            "id": message_id,
+                            "kind": kind,
+                            "name": name,
+                            "size": size,
+                            "date": getattr(message, "date", 0),
+                            "text": _clean(getattr(message, "message", "")),
+                        }
+
+                        if message_id in keep_ids:
+                            kept.append(entry)
+                            continue
+
+                        found[message_id] = entry
+
+                    self._update_progress(
+                        "Найдено: %d" % len(found),
+                        "Просмотрено сообщений до #%d" % lowest,
+                    )
+
+                    if len(messages) < PAGE_LIMIT:
+                        break
+                    if lowest <= 1 or lowest >= offset_id > 0:
+                        break
+                    offset_id = lowest
+                    time.sleep(PAGE_DELAY)
+
+            entries = sorted(found.values(), key=lambda item: item["id"])
+            self._dismiss_progress()
+            run_on_ui_thread(
+                lambda: self._show_preview(dialog_id, entries, kept, keep_ids)
+            )
+        except Exception as exception:
+            log("[file_posts_cleaner] scan failed:\n" + traceback.format_exc())
+            message = str(exception)
+            self._dismiss_progress()
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не получилось: %s" % message))
+
+    # ------------------------------------------------------------------
+    # Предпросмотр
+    # ------------------------------------------------------------------
+
+    def _line(self, entry):
+        return "%s #%d · %s · %s · %s%s" % (
+            KIND_ICON.get(entry["kind"], "📎"),
+            entry["id"],
+            _clean(entry["name"], 34),
+            _human_size(entry["size"]),
+            _fmt_date(entry["date"]),
+            (" · «%s»" % entry["text"]) if entry["text"] else "",
+        )
+
+    def _show_preview(self, dialog_id, entries, kept, keep_ids):
+        self._busy = False
+
+        if self.get_setting("save_report", True) and entries:
+            threading.Thread(
+                target=self._send_report,
+                args=(dialog_id, entries, kept),
+                daemon=True,
+            ).start()
+
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_error("Нет активного окна для показа списка")
+            return
+
+        if not entries:
+            builder = AlertDialogBuilder(activity)
+            builder.set_title("Ничего не найдено")
+            builder.set_message(
+                "Постов с вложениями по текущим настройкам нет.\n\n"
+                "Проверьте режим поиска в настройках плагина."
+            )
+            builder.set_positive_button("Ок", lambda b, w: b.dismiss())
+            builder.show()
+            return
+
+        lines = [self._line(entry) for entry in entries[:PREVIEW_LINES]]
+        if len(entries) > PREVIEW_LINES:
+            lines.append("…и ещё %d постов" % (len(entries) - PREVIEW_LINES))
+
+        total_size = sum(entry["size"] or 0 for entry in entries)
+        header = "Будет удалено постов: %d\nОбщий объём: %s\n\n" % (
+            len(entries),
+            _human_size(total_size),
+        )
+
+        footer = ""
+        if keep_ids:
+            footer += "\n\nСохраняю (не удаляю): %s" % ", ".join(
+                "#%d" % value for value in sorted(keep_ids)
+            )
+            if kept:
+                footer += "\nИз них реально найдены в канале: %s" % ", ".join(
+                    "#%d" % entry["id"] for entry in kept
+                )
+            else:
+                footer += "\n⚠️ Ни один из них не попал в выборку — возможно, у поста нет файла."
+        if self.get_setting("save_report", True):
+            footer += "\n\nПолный список отправлен в «Избранное»."
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Проверьте список")
+        builder.set_message(header + "\n".join(lines) + footer)
+
+        dry_run = self.get_setting("dry_run", True)
+        if dry_run:
+            builder.set_positive_button("Понятно", lambda b, w: b.dismiss())
+            builder.set_negative_button(
+                "Выключить режим просмотра",
+                lambda b, w: self._disable_dry_run(b),
+            )
+        else:
+            def on_delete(bld, which):
+                bld.dismiss()
+                if self.get_setting("confirm_twice", True):
+                    self._show_final_confirm(dialog_id, entries)
+                else:
+                    self._begin_delete(dialog_id, entries)
+
+            builder.set_positive_button("Удалить %d" % len(entries), on_delete)
+            builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+
+        builder.create()
+        builder.set_cancelable(True)
+        builder.show()
+        if not dry_run:
+            try:
+                builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+            except Exception:
+                pass
+
+    def _disable_dry_run(self, builder):
+        builder.dismiss()
+        self.set_setting("dry_run", False, reload_settings=True)
+        BulletinHelper.show_info(
+            "Режим просмотра выключен. Запустите проверку ещё раз — появится кнопка удаления."
+        )
+
+    def _show_final_confirm(self, dialog_id, entries):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return
+
+        preview = ", ".join("#%d" % entry["id"] for entry in entries[:12])
+        if len(entries) > 12:
+            preview += " …"
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить безвозвратно?")
+        builder.set_message(
+            "Постов к удалению: %d\n%s\n\n"
+            "Удаление в канале необратимо — восстановить их не получится."
+            % (len(entries), preview)
+        )
+        builder.set_positive_button(
+            "Да, удалить",
+            lambda b, w: (b.dismiss(), self._begin_delete(dialog_id, entries)),
+        )
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
+        try:
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
+    # Удаление
+    # ------------------------------------------------------------------
+
+    def _begin_delete(self, dialog_id, entries):
+        if self._busy:
+            BulletinHelper.show_info("Подождите, идёт другая операция")
+            return
+        self._busy = True
+        self._show_progress("Удаляю…", "0 из %d" % len(entries))
+        threading.Thread(
+            target=self._delete_worker, args=(dialog_id, entries), daemon=True
+        ).start()
+
+    def _delete_request(self, dialog_id, ids):
+        peer = self._input_peer(dialog_id)
+        vector = None
+
+        if isinstance(peer, TLRPC.TL_inputPeerChannel):
+            request = TLRPC.TL_channels_deleteMessages()
+            channel = TLRPC.TL_inputChannel()
+            channel.channel_id = peer.channel_id
+            channel.access_hash = peer.access_hash
+            request.channel = channel
+            vector = request.id
+        else:
+            request = TLRPC.TL_messages_deleteMessages()
+            request.revoke = True
+            vector = request.id
+
+        for message_id in ids:
+            vector.add(Integer(int(message_id)))
+        return request
+
+    def _delete_worker(self, dialog_id, entries):
+        ids = [entry["id"] for entry in entries]
+        deleted = 0
+        failed = []
+
+        try:
+            for start in range(0, len(ids), DELETE_CHUNK):
+                chunk = ids[start : start + DELETE_CHUNK]
+                request = self._delete_request(dialog_id, chunk)
+                response, error = self._request_retrying(request)
+                if error is not None:
+                    failed.extend(chunk)
+                    log(
+                        "[file_posts_cleaner] чанк не удалён (%s): %s"
+                        % (_error_text(error), chunk)
+                    )
+                else:
+                    deleted += len(chunk)
+
+                self._update_progress(
+                    "Удаляю…", "%d из %d" % (deleted, len(ids))
+                )
+                if start + DELETE_CHUNK < len(ids):
+                    time.sleep(CHUNK_DELAY)
+        except Exception as exception:
+            log("[file_posts_cleaner] delete failed:\n" + traceback.format_exc())
+            message = str(exception)
+            self._dismiss_progress()
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Сбой удаления: %s" % message))
+            return
+
+        self._dismiss_progress()
+        self._busy = False
+
+        if self.get_setting("save_report", True):
+            summary = "🗑 Удалено постов: %d из %d" % (deleted, len(ids))
+            if failed:
+                summary += "\nНе удалось: %s" % ", ".join("#%d" % v for v in failed[:50])
+            self._send_saved(summary)
+
+        def notify():
+            if failed:
+                BulletinHelper.show_error(
+                    "Удалено %d, не удалось %d" % (deleted, len(failed))
+                )
+            else:
+                BulletinHelper.show_success("Удалено постов: %d" % deleted)
+
+        run_on_ui_thread(notify)
+
+    # ------------------------------------------------------------------
+    # Отчёт в «Избранное»
+    # ------------------------------------------------------------------
+
+    def _send_saved(self, text):
+        try:
+            self_id = get_user_config().getClientUserId()
+        except Exception:
+            log("[file_posts_cleaner] нет user config для отчёта")
+            return
+        for start in range(0, len(text), REPORT_CHUNK):
+            send_text(self_id, text[start : start + REPORT_CHUNK])
+            time.sleep(0.2)
+
+    def _send_report(self, dialog_id, entries, kept):
+        try:
+            lines = [
+                "📋 Чистка постов с файлами",
+                "Канал: %d" % dialog_id,
+                "К удалению: %d поста(ов)" % len(entries),
+                "",
+            ]
+            lines.extend(self._line(entry) for entry in entries)
+            if kept:
+                lines.append("")
+                lines.append("Оставляю без изменений:")
+                lines.extend(self._line(entry) for entry in kept)
+            self._send_saved("\n".join(lines))
+        except Exception:
+            log("[file_posts_cleaner] отчёт не отправлен:\n" + traceback.format_exc())
+
+    # ------------------------------------------------------------------
+    # Прогресс
+    # ------------------------------------------------------------------
+
+    def _show_progress(self, title, message):
+        def build():
+            fragment = get_last_fragment()
+            activity = fragment.getParentActivity() if fragment else None
+            if activity is None:
+                return
+            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            builder.set_title(title)
+            builder.set_message(message)
+            builder.show()
+            try:
+                builder.set_cancelable(False)
+            except Exception:
+                pass
+            self._dialog = builder
+
+        run_on_ui_thread(build)
+
+    def _update_progress(self, title, message):
+        def apply():
+            builder = self._dialog
+            if builder is None:
+                return
+            try:
+                builder.set_title(title)
+                builder.set_message(message)
+            except Exception:
+                pass
+
+        run_on_ui_thread(apply)
+
+    def _dismiss_progress(self):
+        def close():
+            builder = self._dialog
+            self._dialog = None
+            if builder is None:
+                return
+            try:
+                builder.dismiss()
+            except Exception:
+                pass
+
+        run_on_ui_thread(close)
