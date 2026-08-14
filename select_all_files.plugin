@@ -6,6 +6,8 @@
 чтобы дальше удалить их штатной корзиной Telegram.
 """
 
+import threading
+import time
 import traceback
 
 from java import jarray
@@ -51,6 +53,12 @@ ADAPTER_FIELDS = (
     "linksAdapter",
     "gifAdapter",
 )
+
+LIST_FIELDS = ("listView", "recyclerListView", "recyclerView")
+
+LOAD_ROUNDS = 40
+LOAD_PAUSE = 0.7
+LOAD_STALLS = 3
 
 
 def _parse_limit(raw, fallback=100):
@@ -247,6 +255,16 @@ class SelectAllPlugin(BasePlugin):
                 icon="msg_limit_hit",
             ),
             Switch(
+                key="auto_load",
+                text="Докручивать список сам",
+                default=True,
+                subtext=(
+                    "Плагин сам прокручивает вкладку вниз, пока клиент не подгрузит "
+                    "нужное количество. Иначе отмечается только видимое."
+                ),
+                icon="msg_download",
+            ),
+            Switch(
                 key="force",
                 text="Обходить проверки клиента",
                 default=False,
@@ -432,8 +450,60 @@ class SelectAllPlugin(BasePlugin):
             _call(adapter, "notifyDataSetChanged")
         _call(layout, "invalidate")
 
+    # ------------------------------------------------------------------
+    # Догрузка списка
+    # ------------------------------------------------------------------
+
+    def _list_views(self, layout):
+        """RecyclerView'ы вкладок — их прокрутка заставляет клиент подгружать медиа."""
+        views = []
+        pages = get_private_field(layout, "mediaPages")
+        if pages is None:
+            return views
+        for index in range(2):
+            page = _array_get(pages, index)
+            if page is None:
+                continue
+            _, view = _first_field(page, LIST_FIELDS)
+            if view is not None:
+                views.append(view)
+        return views
+
+    def _load_more(self, layout, tab, limit):
+        """Прокручивает список вниз, пока клиент подгружает новые элементы."""
+        views = self._list_views(layout)
+        if not views:
+            log("[select_all_files] не нашёл списки вкладок, догрузка пропущена")
+            return self._messages(layout, tab)
+
+        messages = self._messages(layout, tab)
+        stalls = 0
+
+        for _ in range(LOAD_ROUNDS):
+            if len(messages) >= limit:
+                break
+
+            position = max(len(messages) - 1, 0)
+            for view in views:
+                run_on_ui_thread(
+                    lambda v=view, p=position: _call(v, "scrollToPosition", [Integer(int(p))])
+                )
+
+            time.sleep(LOAD_PAUSE)
+
+            grown = self._messages(layout, tab)
+            if len(grown) <= len(messages):
+                stalls += 1
+                if stalls >= LOAD_STALLS:
+                    break
+            else:
+                stalls = 0
+            messages = grown
+
+        return messages
+
     def _on_click(self, context=None):
-        run_on_ui_thread(self._run)
+        threading.Thread(target=self._run, daemon=True).start()
 
     def _run(self):
         try:
@@ -442,12 +512,24 @@ class SelectAllPlugin(BasePlugin):
             tab = self._tab(layout)
             messages = self._messages(layout, tab)
 
+            if messages and len(messages) < limit and self.get_setting("auto_load", True):
+                BulletinHelper.show_info("Докручиваю список, подождите")
+                messages = self._load_more(layout, tab, limit)
+
             if not messages:
                 BulletinHelper.show_error(
                     "На вкладке «%s» пока ничего не загружено" % TAB_NAMES.get(tab, tab)
                 )
                 return
 
+            # Выделение трогает вьюхи клиента, поэтому только на UI-потоке.
+            run_on_ui_thread(lambda: self._select(layout, tab, messages, limit))
+        except Exception as exception:
+            log("[select_all_files] ошибка подготовки:\n" + traceback.format_exc())
+            BulletinHelper.show_error("Не вышло: %s" % exception)
+
+    def _select(self, layout, tab, messages, limit):
+        try:
             forced = bool(self.get_setting("force", False))
             selected = None
             entered = self._enter_selection(layout, tab, messages)
@@ -471,14 +553,12 @@ class SelectAllPlugin(BasePlugin):
 
             tail = ""
             if len(messages) > limit:
-                tail = ", загружено %d — поднимите лимит или повторите" % len(messages)
-            elif len(messages) >= 40:
-                tail = ", прокрутите ниже и нажмите ещё раз"
+                tail = ", загружено %d — поднимите лимит в настройках" % len(messages)
 
             BulletinHelper.show_success(
                 "Отмечено %d на вкладке «%s»%s"
                 % (total or selected, TAB_NAMES.get(tab, tab), tail)
             )
         except Exception as exception:
-            log("[select_all_files] ошибка:\n" + traceback.format_exc())
+            log("[select_all_files] ошибка выделения:\n" + traceback.format_exc())
             BulletinHelper.show_error("Не вышло: %s" % exception)
