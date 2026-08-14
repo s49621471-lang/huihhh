@@ -134,11 +134,32 @@ def _normalize_dialog(chat_id):
     """Приводит 2053026588 / -1002053026588 / -100... к диалоговому id."""
     if chat_id is None:
         return None
+    try:
+        chat_id = int(chat_id)
+    except Exception:
+        return None
     if chat_id < 0:
         return chat_id
     if chat_id > 1000000000000:
         return -chat_id
     return -(1000000000000 + chat_id)
+
+
+def _canonical_chat(chat_id):
+    """Голый id чата: -1002053026588, -2053026588 и 2053026588 дают 2053026588."""
+    if chat_id is None:
+        return None
+    try:
+        value = abs(int(chat_id))
+    except Exception:
+        return None
+    text = str(value)
+    if len(text) > 12 and text.startswith("100"):
+        try:
+            value = int(text[3:])
+        except Exception:
+            pass
+    return value
 
 
 def _flood_wait_seconds(error):
@@ -383,23 +404,21 @@ class FilePostsCleanerPlugin(BasePlugin):
             BulletinHelper.show_error("Не удалось определить чат")
             return
 
-        self._start(int(dialog_id))
+        self._start(_normalize_dialog(dialog_id))
 
     def _start(self, dialog_id):
         if self._busy:
             BulletinHelper.show_info("Уже идёт сканирование")
             return
 
-        allowed_raw = self.get_setting("allowed_chat", DEFAULT_CHAT)
-        allowed_id = _normalize_dialog(_parse_chat_id(allowed_raw))
-        if allowed_id is not None and allowed_id != dialog_id:
-            BulletinHelper.show_error(
-                "Этот чат не разрешён. В настройках указан %s" % allowed_id
-            )
+        if dialog_id is None or dialog_id >= 0:
+            BulletinHelper.show_error("Плагин работает только с каналами и группами")
             return
 
-        if dialog_id >= 0:
-            BulletinHelper.show_error("Плагин работает только с каналами и группами")
+        allowed_raw = self.get_setting("allowed_chat", DEFAULT_CHAT)
+        allowed_id = _normalize_dialog(_parse_chat_id(allowed_raw))
+        if allowed_id is not None and _canonical_chat(allowed_id) != _canonical_chat(dialog_id):
+            self._show_wrong_chat(dialog_id, allowed_id)
             return
 
         self._busy = True
@@ -407,6 +426,48 @@ class FilePostsCleanerPlugin(BasePlugin):
         threading.Thread(
             target=self._scan_worker, args=(dialog_id,), daemon=True
         ).start()
+
+    def _chat_title(self, dialog_id):
+        try:
+            chat = get_messages_controller().getChat(_canonical_chat(dialog_id))
+            if chat is not None:
+                return str(chat.title)
+        except Exception:
+            pass
+        return None
+
+    def _show_wrong_chat(self, dialog_id, allowed_id):
+        title = self._chat_title(dialog_id)
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_error(
+                "Чат не разрешён. Этот: %s, в настройках: %s" % (dialog_id, allowed_id)
+            )
+            return
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Не тот чат")
+        builder.set_message(
+            "Плагин привязан к одному каналу и в других не работает.\n\n"
+            "Этот чат: %s%s\n"
+            "В настройках: %s\n\n"
+            "Если открыт именно тот канал, который надо чистить — нажмите «Разрешить», "
+            "его id запишется в настройки и сканирование начнётся сразу."
+            % (dialog_id, (" — %s" % title) if title else "", allowed_id)
+        )
+        builder.set_positive_button(
+            "Разрешить этот чат",
+            lambda b, w: (b.dismiss(), self._allow_chat(dialog_id)),
+        )
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
+
+    def _allow_chat(self, dialog_id):
+        self.set_setting("allowed_chat", str(dialog_id), reload_settings=True)
+        BulletinHelper.show_info("Канал %s разрешён" % dialog_id)
+        self._start(dialog_id)
 
     # ------------------------------------------------------------------
     # Запросы
