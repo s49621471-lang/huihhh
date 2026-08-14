@@ -910,7 +910,11 @@ class FilePostsCleanerPlugin(BasePlugin):
             BulletinHelper.show_info("Подождите, идёт другая операция")
             return
         self._busy = True
-        self._show_progress("Удаляю…", "0 из %d" % len(entries))
+        self._show_progress(
+            "Удаляю 0 из %d" % len(entries),
+            "Осталось: %d\nНе удалось: 0" % len(entries),
+            determinate=True,
+        )
         threading.Thread(
             target=self._delete_worker, args=(dialog_id, entries), daemon=True
         ).start()
@@ -954,8 +958,12 @@ class FilePostsCleanerPlugin(BasePlugin):
                 else:
                     deleted += len(chunk)
 
+                processed = deleted + len(failed)
+                remaining = len(ids) - processed
                 self._update_progress(
-                    "Удаляю…", "%d из %d" % (deleted, len(ids))
+                    "Удаляю %d из %d" % (deleted, len(ids)),
+                    "Осталось: %d\nНе удалось: %d" % (remaining, len(failed)),
+                    percent=int(processed * 100 / max(len(ids), 1)),
                 )
                 if start + DELETE_CHUNK < len(ids):
                     time.sleep(CHUNK_DELAY)
@@ -973,18 +981,52 @@ class FilePostsCleanerPlugin(BasePlugin):
         if self.get_setting("save_report", True):
             summary = "🗑 Удалено постов: %d из %d" % (deleted, len(ids))
             if failed:
-                summary += "\nНе удалось: %s" % ", ".join("#%d" % v for v in failed[:50])
+                summary += "\nНе удалось удалить: %d\n%s" % (
+                    len(failed),
+                    ", ".join("#%d" % value for value in failed[:100]),
+                )
             self._send_saved(summary)
 
-        def notify():
-            if failed:
-                BulletinHelper.show_error(
-                    "Удалено %d, не удалось %d" % (deleted, len(failed))
-                )
-            else:
-                BulletinHelper.show_success("Удалено постов: %d" % deleted)
+        run_on_ui_thread(
+            lambda: self._show_delete_result(dialog_id, deleted, failed, len(ids))
+        )
 
-        run_on_ui_thread(notify)
+    def _show_delete_result(self, dialog_id, deleted, failed, total):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_success("Удалено %d из %d" % (deleted, total))
+            return
+
+        lines = [
+            "Удалено: %d из %d" % (deleted, total),
+            "Не удалось: %d" % len(failed),
+        ]
+        if failed:
+            preview = ", ".join("#%d" % value for value in failed[:15])
+            if len(failed) > 15:
+                preview += " …"
+            lines.append("")
+            lines.append("Остались: %s" % preview)
+            lines.append("")
+            lines.append(
+                "Обычно это ограничение на удаление чужих постов или флуд-контроль. "
+                "Запустите проверку ещё раз — плагин покажет, что реально осталось."
+            )
+        elif self.get_setting("save_report", True):
+            lines.append("")
+            lines.append("Отчёт отправлен в «Избранное».")
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Готово" if not failed else "Готово с ошибками")
+        builder.set_message("\n".join(lines))
+        builder.set_positive_button(
+            "Проверить остаток",
+            lambda b, w: (b.dismiss(), self._start(dialog_id)),
+        )
+        builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
 
     # ------------------------------------------------------------------
     # Отчёт в «Избранное»
@@ -1021,13 +1063,18 @@ class FilePostsCleanerPlugin(BasePlugin):
     # Прогресс
     # ------------------------------------------------------------------
 
-    def _show_progress(self, title, message):
+    def _show_progress(self, title, message, determinate=False):
         def build():
             fragment = get_last_fragment()
             activity = fragment.getParentActivity() if fragment else None
             if activity is None:
                 return
-            builder = AlertDialogBuilder(activity, AlertDialogBuilder.ALERT_TYPE_SPINNER)
+            style = (
+                AlertDialogBuilder.ALERT_TYPE_LOADING
+                if determinate
+                else AlertDialogBuilder.ALERT_TYPE_SPINNER
+            )
+            builder = AlertDialogBuilder(activity, style)
             builder.set_title(title)
             builder.set_message(message)
             builder.show()
@@ -1035,11 +1082,16 @@ class FilePostsCleanerPlugin(BasePlugin):
                 builder.set_cancelable(False)
             except Exception:
                 pass
+            if determinate:
+                try:
+                    builder.set_progress(0)
+                except Exception:
+                    pass
             self._dialog = builder
 
         run_on_ui_thread(build)
 
-    def _update_progress(self, title, message):
+    def _update_progress(self, title, message, percent=None):
         def apply():
             builder = self._dialog
             if builder is None:
@@ -1049,6 +1101,11 @@ class FilePostsCleanerPlugin(BasePlugin):
                 builder.set_message(message)
             except Exception:
                 pass
+            if percent is not None:
+                try:
+                    builder.set_progress(max(0, min(100, int(percent))))
+                except Exception:
+                    pass
 
         run_on_ui_thread(apply)
 
