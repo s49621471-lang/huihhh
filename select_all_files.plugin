@@ -723,6 +723,16 @@ class FilesCleanerPlugin(BasePlugin):
                 icon="msg_pin",
             ),
             Switch(
+                key="group_channel_only",
+                text="В обсуждении — только посты канала",
+                default=True,
+                subtext=(
+                    "Сервер отдаёт лишь посты канала, а не всю переписку участников. "
+                    "Выключайте, только если нужна статистика по участникам."
+                ),
+                icon="msg_channel",
+            ),
+            Switch(
                 key="silent",
                 text="Не отвлекать уведомлениями",
                 default=False,
@@ -938,6 +948,32 @@ class FilesCleanerPlugin(BasePlugin):
     # Кто сколько постил
     # ------------------------------------------------------------------
 
+    def _search_from_page(self, dialog_id, source_channel, offset_id):
+        """Поиск с отправителем: сервер сам отдаёт только посты канала."""
+        controller = get_messages_controller()
+        request = TLRPC.TL_messages_search()
+        request.peer = controller.getInputPeer(dialog_id)
+        request.q = ""
+        request.filter = TLRPC.TL_inputMessagesFilterEmpty()
+        request.from_id = controller.getInputPeer(_normalize_dialog(source_channel))
+        try:
+            request.flags = int(getattr(request, "flags", 0)) | 1
+        except Exception:
+            request.flags = 1
+        request.min_date = 0
+        request.max_date = 0
+        request.offset_id = offset_id
+        request.add_offset = 0
+        request.limit = PAGE_LIMIT
+        request.max_id = 0
+        request.min_id = 0
+        for field in ("hash", "hash_"):
+            try:
+                setattr(request, field, 0)
+            except Exception:
+                pass
+        return request
+
     def _history_page(self, dialog_id, offset_id):
         request = TLRPC.TL_messages_getHistory()
         request.peer = get_messages_controller().getInputPeer(dialog_id)
@@ -954,8 +990,13 @@ class FilesCleanerPlugin(BasePlugin):
                 pass
         return request
 
-    def _collect_authors(self, dialog_id, keep_ids):
-        """Все посты подряд: по авторам, по содержимому и по источникам пересылки."""
+    def _collect_authors(self, dialog_id, keep_ids, page_builder=None):
+        """Посты по авторам, содержимому и источникам пересылки.
+
+        page_builder задаёт, что обходим: всю историю или только посты канала.
+        """
+        if page_builder is None:
+            page_builder = lambda offset_id: self._history_page(dialog_id, offset_id)
         authors = {}
         kinds = {}
         sources = {}
@@ -969,9 +1010,7 @@ class FilesCleanerPlugin(BasePlugin):
                 self._note("обход прерван вручную")
                 break
 
-            response, error = self._request_retrying(
-                self._history_page(dialog_id, offset_id)
-            )
+            response, error = self._request_retrying(page_builder(offset_id))
             if error is not None:
                 raise RuntimeError("история не прочиталась: %s" % _error_text(error))
             if response is None:
@@ -1074,12 +1113,24 @@ class FilesCleanerPlugin(BasePlugin):
     def _authors_job(self, dialog_id):
         try:
             keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
+            page_builder = None
+
+            if self._is_broadcast(dialog_id) is False and self.get_setting(
+                "group_channel_only", True
+            ):
+                page_builder, source = self._channel_pages(dialog_id)
+                if page_builder is not None:
+                    self._note(
+                        "группа обсуждений: считаю только посты канала %s "
+                        "(переключается в настройках)" % source
+                    )
+
             self._note("чат %s, считаю авторов" % dialog_id)
-            self._set_status("Читаю историю…")
-            self._quiet_bulletin("Читаю историю, прогресс в настройках")
+            self._set_status("Читаю посты…")
+            self._quiet_bulletin("Читаю посты, прогресс в настройках")
 
             authors, kinds, sources, _forwarded, total = self._collect_authors(
-                dialog_id, keep_ids
+                dialog_id, keep_ids, page_builder
             )
             if not authors:
                 self._busy = False
@@ -1156,6 +1207,27 @@ class FilesCleanerPlugin(BasePlugin):
     # Оставить только избранных авторов
     # ------------------------------------------------------------------
 
+    def _channel_pages(self, dialog_id):
+        """Обходчик только постов канала — для групп обсуждений.
+
+        Возвращает (page_builder, id канала) или (None, None), если канал неизвестен.
+        """
+        wanted = _normalize_dialog(self.get_setting("source_channel", ""))
+        source = abs(wanted) if wanted else None
+        if not source:
+            try:
+                source = self._linked_channel(dialog_id)
+            except Exception as error:
+                self._note("привязку чата определить не вышло: %s" % error)
+                source = None
+        if not source:
+            return None, None
+
+        def builder(offset_id, channel=source):
+            return self._search_from_page(dialog_id, channel, offset_id)
+
+        return builder, source
+
     def _is_broadcast(self, dialog_id):
         """True — канал, False — группа обсуждений, None — не понял."""
         try:
@@ -1193,19 +1265,25 @@ class FilesCleanerPlugin(BasePlugin):
 
             broadcast = self._is_broadcast(dialog_id)
             only_forwarded = broadcast is False
+            page_builder = None
+
+            if only_forwarded:
+                # В обсуждении миллион сообщений участников — их читать незачем.
+                page_builder, source = self._channel_pages(dialog_id)
+                if page_builder is None:
+                    raise RuntimeError(
+                        "не понял, какой канал привязан — впишите его в «Канал-источник»"
+                    )
+                self._note("группа обсуждений: беру только посты канала %s" % source)
+
             self._note(
-                "чат %s, оставляю авторов: %s%s"
-                % (
-                    dialog_id,
-                    ", ".join(keep_names),
-                    " (только пересланное из канала)" if only_forwarded else "",
-                )
+                "чат %s, оставляю авторов: %s" % (dialog_id, ", ".join(keep_names))
             )
-            self._set_status("Читаю историю…")
-            self._quiet_bulletin("Читаю историю, прогресс в настройках")
+            self._set_status("Читаю посты…")
+            self._quiet_bulletin("Читаю посты, прогресс в настройках")
 
             authors, _kinds, _sources, forwarded, total = self._collect_authors(
-                dialog_id, keep_ids
+                dialog_id, keep_ids, page_builder
             )
             if not authors:
                 self._busy = False
@@ -1220,7 +1298,8 @@ class FilesCleanerPlugin(BasePlugin):
             for key, bucket in sorted(authors.items(), key=lambda item: -len(item[1]["ids"])):
                 title = self._author_title(key)
                 ids = bucket["ids"]
-                if only_forwarded:
+                if only_forwarded and page_builder is None:
+                    # Поиск по отправителю уже отсеял чужое, фильтр нужен только при обходе истории.
                     ids = [value for value in ids if value in forwarded]
                 if not ids:
                     continue
