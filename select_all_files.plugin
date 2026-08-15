@@ -795,8 +795,20 @@ class FilesCleanerPlugin(BasePlugin):
         """Канал, привязанный к этой группе обсуждений."""
         controller = get_messages_controller()
         chat_id = abs(int(dialog_id))
-        for arguments in ([Long(chat_id)], [Integer(chat_id)]):
-            full = _call(controller, "getChatFull", arguments)
+
+        variants = [[Long(chat_id)]]
+        if chat_id <= 2147483647:
+            # id крупных чатов в int уже не помещается — такой вызов даже не строим.
+            try:
+                variants.append([Integer(chat_id)])
+            except Exception:
+                pass
+
+        for arguments in variants:
+            try:
+                full = _call(controller, "getChatFull", arguments)
+            except Exception:
+                continue
             if full is None:
                 continue
             value = _field(full, "linked_chat_id")
@@ -835,15 +847,40 @@ class FilesCleanerPlugin(BasePlugin):
             entries = self._collect_entries(dialog_id, target, keep_ids)
             self._note("всего постов с вложениями в чате: %d" % len(entries))
 
-            wanted = _normalize_dialog(self.get_setting("source_channel", ""))
-            source = abs(wanted) if wanted else self._linked_channel(dialog_id)
-            if source:
-                self._note("канал-источник: %s" % source)
-
             counts = {}
             for _, channel_id in entries:
                 if channel_id:
                     counts[channel_id] = counts.get(channel_id, 0) + 1
+            if counts:
+                self._note(
+                    "источники в чате: %s"
+                    % ", ".join(
+                        "%s×%d" % (key, counts[key])
+                        for key in sorted(counts, key=lambda k: -counts[k])[:6]
+                    )
+                )
+            else:
+                self._note("ни у одного поста не нашлось признаков пересылки")
+
+            wanted = _normalize_dialog(self.get_setting("source_channel", ""))
+            source = abs(wanted) if wanted else None
+            if source:
+                self._note("канал-источник задан вручную: %s" % source)
+            else:
+                try:
+                    source = self._linked_channel(dialog_id)
+                except Exception as link_error:
+                    source = None
+                    self._note("привязку чата определить не вышло: %s" % link_error)
+                if source:
+                    self._note("канал-источник по привязке чата: %s" % source)
+
+            if source and source not in counts:
+                self._note(
+                    "постов от канала %s в выборке нет — беру источник по содержимому"
+                    % source
+                )
+                source = None
 
             if not source and counts:
                 source = max(counts, key=lambda key: counts[key])
