@@ -289,6 +289,54 @@ def _source_channel(message):
     return _peer_channel_id(_field(message, "from_id"))
 
 
+def _peer_kind_id(peer):
+    """('u'|'c', id) для TLRPC.Peer, или None."""
+    if peer is None:
+        return None
+    for name, kind in (("user_id", "u"), ("channel_id", "c"), ("chat_id", "c")):
+        value = _field(peer, name)
+        if value:
+            try:
+                number = abs(int(value))
+            except Exception:
+                continue
+            if number:
+                return kind, number
+    return None
+
+
+def _author_key(message):
+    """Кто написал пост: ('u', id) / ('c', id) / ('n', подпись) / ('?', None)."""
+    author = _peer_kind_id(_field(message, "from_id"))
+    if author:
+        return author
+    signature = _field(message, "post_author")
+    if signature:
+        return "n", str(signature)
+    peer = _peer_kind_id(_field(message, "peer_id"))
+    if peer:
+        return peer
+    return "?", None
+
+
+def _has_document(message):
+    media = _field(message, "media")
+    if media is None:
+        return False
+    return isinstance(media, TLRPC.TL_messageMediaDocument)
+
+
+def _has_media(message):
+    media = _field(message, "media")
+    if media is None:
+        return False
+    if isinstance(media, TLRPC.TL_messageMediaWebPage):
+        return False
+    if isinstance(media, TLRPC.TL_messageMediaEmpty):
+        return False
+    return True
+
+
 def _message_id(message):
     """id поста: поле, геттер или рефлексия — что сработает."""
     try:
@@ -412,6 +460,12 @@ class FilesCleanerPlugin(BasePlugin):
                 "msg_forward",
                 "Только пересланное из канала",
                 self._on_forwarded_click,
+            ),
+            (
+                "Кто сколько постил",
+                "msg_stats",
+                "Авторы, счётчики и удаление по автору",
+                self._on_authors_click,
             ),
             ("Выделить все", "msg_select", "Отметить открытую вкладку", self._on_select_click),
         )
@@ -540,6 +594,13 @@ class FilesCleanerPlugin(BasePlugin):
                 icon="msg_delete",
                 red=True,
                 on_click=lambda view=None: self._on_delete_click({}),
+            ),
+            Text(
+                text="Кто сколько постил",
+                subtext="Все посты по авторам, с удалением по автору",
+                icon="msg_stats",
+                accent=True,
+                on_click=lambda view=None: self._on_authors_click({}),
             ),
             Text(
                 text="Удалить репосты канала",
@@ -786,6 +847,221 @@ class FilesCleanerPlugin(BasePlugin):
 
         entries.sort(key=lambda item: item[0])
         return entries
+
+    # ------------------------------------------------------------------
+    # Кто сколько постил
+    # ------------------------------------------------------------------
+
+    def _history_page(self, dialog_id, offset_id):
+        request = TLRPC.TL_messages_getHistory()
+        request.peer = get_messages_controller().getInputPeer(dialog_id)
+        request.offset_id = offset_id
+        request.offset_date = 0
+        request.add_offset = 0
+        request.limit = PAGE_LIMIT
+        request.max_id = 0
+        request.min_id = 0
+        for field in ("hash", "hash_"):
+            try:
+                setattr(request, field, 0)
+            except Exception:
+                pass
+        return request
+
+    def _collect_authors(self, dialog_id, keep_ids):
+        """Все посты подряд, разложенные по авторам."""
+        authors = {}
+        seen = set()
+        offset_id = 0
+        total = 0
+
+        for _ in range(MAX_PAGES):
+            if self._stop:
+                self._note("обход прерван вручную")
+                break
+
+            response, error = self._request_retrying(
+                self._history_page(dialog_id, offset_id)
+            )
+            if error is not None:
+                raise RuntimeError("история не прочиталась: %s" % _error_text(error))
+            if response is None:
+                break
+
+            messages = _messages_of(response)
+            if messages is None:
+                self._note("страница истории не разобралась (%s)" % _class_name(response))
+                break
+            if not messages:
+                break
+
+            lowest = offset_id
+            for message in messages:
+                message_id = _message_id(message)
+                if message_id is None:
+                    continue
+                if lowest == 0 or message_id < lowest:
+                    lowest = message_id
+                if message_id in seen:
+                    continue
+                seen.add(message_id)
+                total += 1
+
+                if message_id in keep_ids:
+                    continue
+
+                key = _author_key(message)
+                bucket = authors.get(key)
+                if bucket is None:
+                    bucket = {"ids": [], "files": 0, "media": 0}
+                    authors[key] = bucket
+                bucket["ids"].append(message_id)
+                if _has_document(message):
+                    bucket["files"] += 1
+                if _has_media(message):
+                    bucket["media"] += 1
+
+            self._set_status("Читаю историю: %d постов, авторов %d" % (total, len(authors)))
+
+            if len(messages) < PAGE_LIMIT:
+                break
+            if lowest <= 1 or (offset_id > 0 and lowest >= offset_id):
+                break
+            offset_id = lowest
+            time.sleep(PAGE_PAUSE)
+
+        return authors, total
+
+    def _author_title(self, key):
+        kind, value = key
+        if kind == "n":
+            return "Подпись: %s" % value
+        if kind == "?":
+            return "Без автора"
+
+        controller = get_messages_controller()
+        getter = "getUser" if kind == "u" else "getChat"
+        entity = None
+        try:
+            entity = _call(controller, getter, [Long(int(value))])
+        except Exception:
+            entity = None
+
+        parts = []
+        if entity is not None:
+            for name in ("first_name", "last_name", "title"):
+                piece = _field(entity, name)
+                if piece:
+                    parts.append(str(piece))
+            username = _field(entity, "username")
+            if username:
+                parts.append("@%s" % username)
+
+        label = " ".join(parts) if parts else ("канал" if kind == "c" else "пользователь")
+        return "%s · %s" % (label, value)
+
+    def _on_authors_click(self, context=None):
+        if self._busy:
+            BulletinHelper.show_info("Уже работаю, прогресс в настройках")
+            return
+        dialog_id = self._dialog_id(context)
+        if not dialog_id:
+            BulletinHelper.show_error("Не понял, какой это чат — откройте его")
+            return
+        self._busy = True
+        self._stop = False
+        threading.Thread(target=self._authors_job, args=(dialog_id,), daemon=True).start()
+
+    def _authors_job(self, dialog_id):
+        try:
+            keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
+            self._note("чат %s, считаю авторов" % dialog_id)
+            self._set_status("Читаю историю…")
+            self._quiet_bulletin("Читаю историю, прогресс в настройках")
+
+            authors, total = self._collect_authors(dialog_id, keep_ids)
+            if not authors:
+                self._busy = False
+                self._set_status("Постов не нашлось")
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Постов не нашлось"))
+                return
+
+            ranked = sorted(authors.items(), key=lambda item: -len(item[1]["ids"]))
+            self._note("всего постов %d, авторов %d" % (total, len(ranked)))
+            for key, bucket in ranked:
+                self._note(
+                    "%s — постов %d, из них с файлами %d, с любым вложением %d"
+                    % (self._author_title(key), len(bucket["ids"]), bucket["files"], bucket["media"])
+                )
+
+            self._busy = False
+            self._set_status("Авторов: %d, постов: %d" % (len(ranked), total))
+            rows = [
+                (self._author_title(key), bucket) for key, bucket in ranked[:40]
+            ]
+            run_on_ui_thread(lambda: self._show_authors(dialog_id, rows, total))
+        except Exception as exception:
+            message = str(exception)
+            self._note("подсчёт авторов сорвался: %s" % message)
+            self._set_status("Ошибка: %s" % message)
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
+
+    def _show_authors(self, dialog_id, rows, total):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_info("Авторов: %d" % len(rows))
+            return
+
+        items = [
+            "%s — %d постов (файлов %d)" % (title, len(bucket["ids"]), bucket["files"])
+            for title, bucket in rows
+        ]
+
+        def on_pick(builder, index):
+            builder.dismiss()
+            if 0 <= index < len(rows):
+                title, bucket = rows[index]
+                self._confirm_author(dialog_id, title, bucket)
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Постов всего: %d" % total)
+        builder.set_items(items, on_pick)
+        builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        builder.set_neutral_button("Список в лог", lambda b, w: (b.dismiss(), self._copy_logs()))
+        builder.create()
+        builder.show()
+
+    def _confirm_author(self, dialog_id, title, bucket):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            return
+
+        ids = sorted(bucket["ids"])
+        preview = ", ".join("#%d" % value for value in ids[:12])
+        if len(ids) > 12:
+            preview += " …"
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить %d постов?" % len(ids))
+        builder.set_message(
+            "Автор: %s\n\nВсего постов: %d\nИз них с файлами: %d, с любым вложением: %d\n\n%s\n\n"
+            "Удаляются все посты этого автора, не только с файлами. Необратимо."
+            % (title, len(ids), bucket["files"], bucket["media"], preview)
+        )
+        builder.set_positive_button(
+            "Удалить в фоне",
+            lambda b, w: (b.dismiss(), self._start_delete(dialog_id, ids)),
+        )
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
+        try:
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Репосты канала в чате обсуждений
