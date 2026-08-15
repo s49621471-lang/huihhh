@@ -215,6 +215,50 @@ def _call(java_object, name, arguments=()):
         return None
 
 
+def _class_name(value):
+    try:
+        return str(value.getClass().getName())
+    except Exception:
+        return type(value).__name__
+
+
+def _messages_of(response):
+    """Список сообщений из ответа TL — напрямую или через рефлексию."""
+    if response is None:
+        return None
+    holder = None
+    try:
+        holder = response.messages
+    except Exception:
+        holder = None
+    if holder is None:
+        try:
+            holder = get_private_field(response, "messages")
+        except Exception:
+            holder = None
+    if holder is None:
+        return None
+    return _as_list(holder)
+
+
+def _message_id(message):
+    """id поста: поле, геттер или рефлексия — что сработает."""
+    try:
+        return int(message.id)
+    except Exception:
+        pass
+    value = _call(message, "getId")
+    if value is not None:
+        try:
+            return int(value)
+        except Exception:
+            pass
+    try:
+        return int(get_private_field(message, "id"))
+    except Exception:
+        return None
+
+
 def _array_get(java_array, index):
     try:
         return java_array[index]
@@ -630,18 +674,21 @@ class FilesCleanerPlugin(BasePlugin):
             if response is None:
                 break
 
-            try:
-                messages = list(response.messages)
-            except Exception:
-                messages = []
+            messages = _messages_of(response)
+            if messages is None:
+                self._note(
+                    "страница не прочиталась, ответ %s" % _class_name(response)
+                )
+                break
             if not messages:
                 break
 
             lowest = offset_id
+            unreadable = 0
             for message in messages:
-                try:
-                    message_id = int(message.id)
-                except Exception:
+                message_id = _message_id(message)
+                if message_id is None:
+                    unreadable += 1
                     continue
                 if lowest == 0 or message_id < lowest:
                     lowest = message_id
@@ -649,6 +696,12 @@ class FilesCleanerPlugin(BasePlugin):
                     continue
                 seen.add(message_id)
                 ids.append(message_id)
+
+            if unreadable:
+                self._note(
+                    "не прочитал id у %d из %d постов страницы (%s)"
+                    % (unreadable, len(messages), _class_name(messages[0]))
+                )
 
             self._set_status("Собираю список: найдено %d" % len(ids))
 
@@ -875,7 +928,26 @@ class FilesCleanerPlugin(BasePlugin):
                 return
 
             self._set_status("Сверяю с сервером…")
+            _, probe = self._resolve_dialog(dialog_id, target)
+            server_total = getattr(probe, "count", None) or 0
             alive = set(self._collect_ids(dialog_id, target, set()))
+            self._note("сервер насчитал %s, собрано %d" % (server_total, len(alive)))
+
+            if server_total and not alive:
+                # Сервер знает о постах, а список не собрался — чистить нельзя.
+                self._busy = False
+                self._set_status(
+                    "Сервер сообщает о %d постах, но список не читается — кэш не трогаю"
+                    % server_total
+                )
+                self._note("чистка отменена: расхождение сервера и разбора ответа")
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_error(
+                        "Список не читается — кэш не трогаю, смотрите лог"
+                    )
+                )
+                return
+
             ghosts = [value for value in cached if value not in alive]
             self._note("на сервере живых %d, призраков %d" % (len(alive), len(ghosts)))
 

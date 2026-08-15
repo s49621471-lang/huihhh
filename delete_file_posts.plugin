@@ -15,6 +15,8 @@ from java.lang import Integer
 
 from org.telegram.tgnet import TLRPC
 
+from hook_utils import get_private_field
+
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
 from android_utils import log, run_on_ui_thread
 from client_utils import (
@@ -164,6 +166,92 @@ def _canonical_chat(chat_id):
         except Exception:
             pass
     return value
+
+
+def _class_name(value):
+    try:
+        return str(value.getClass().getName())
+    except Exception:
+        return type(value).__name__
+
+
+def _find_method(java_object, name, argc):
+    try:
+        clazz = java_object.getClass()
+    except Exception:
+        return None
+    while clazz is not None:
+        try:
+            methods = clazz.getDeclaredMethods()
+        except Exception:
+            methods = []
+        for method in methods:
+            try:
+                if method.getName() != name or len(method.getParameterTypes()) != argc:
+                    continue
+                method.setAccessible(True)
+                return method
+            except Exception:
+                continue
+        try:
+            clazz = clazz.getSuperclass()
+        except Exception:
+            return None
+    return None
+
+
+def _as_list(value):
+    """Читает java-список, даже если он пришёл безликим Object."""
+    if value is None:
+        return None
+    try:
+        return list(value)
+    except Exception:
+        pass
+    size_method = _find_method(value, "size", 0)
+    get_method = _find_method(value, "get", 1)
+    if size_method is None or get_method is None:
+        return None
+    try:
+        count = int(size_method.invoke(value))
+    except Exception:
+        return None
+    items = []
+    for index in range(count):
+        try:
+            items.append(get_method.invoke(value, Integer(int(index))))
+        except Exception:
+            continue
+    return items
+
+
+def _messages_of(response):
+    if response is None:
+        return None
+    holder = None
+    try:
+        holder = response.messages
+    except Exception:
+        holder = None
+    if holder is None:
+        try:
+            holder = get_private_field(response, "messages")
+        except Exception:
+            holder = None
+    if holder is None:
+        return None
+    return _as_list(holder)
+
+
+def _message_id(message):
+    try:
+        return int(message.id)
+    except Exception:
+        pass
+    try:
+        return int(get_private_field(message, "id"))
+    except Exception:
+        return None
 
 
 def _flood_wait_seconds(error):
@@ -599,11 +687,10 @@ class FilePostsCleanerPlugin(BasePlugin):
                 stats["errors"].append("%s: пустой ответ" % label)
                 return
 
-            try:
-                messages = list(response.messages)
-            except Exception:
+            messages = _messages_of(response)
+            if messages is None:
                 stats["errors"].append(
-                    "%s: неожиданный ответ %s" % (label, type(response).__name__)
+                    "%s: список не читается, ответ %s" % (label, _class_name(response))
                 )
                 return
 
@@ -614,9 +701,8 @@ class FilePostsCleanerPlugin(BasePlugin):
             lowest = offset_id
 
             for message in messages:
-                try:
-                    message_id = int(message.id)
-                except Exception:
+                message_id = _message_id(message)
+                if message_id is None:
                     continue
 
                 if lowest == 0 or message_id < lowest:
