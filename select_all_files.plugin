@@ -86,6 +86,37 @@ def _parse_ids(raw):
     return result
 
 
+def _normalize_dialog(value):
+    """Внутри клиента канал — это -channel_id, без префикса 100 из ссылок."""
+    try:
+        number = int(value)
+    except Exception:
+        return None
+    if number == 0:
+        return None
+    if number > 0:
+        number = -number
+    text = str(abs(number))
+    if len(text) > 12 and text.startswith("100"):
+        try:
+            number = -int(text[3:])
+        except Exception:
+            pass
+    return number
+
+
+def _bot_api_dialog(value):
+    """Тот же чат в записи -100…, на случай если клиент ждёт именно её."""
+    try:
+        number = abs(int(value))
+    except Exception:
+        return None
+    text = str(number)
+    if len(text) > 12 and text.startswith("100"):
+        return -number
+    return -(1000000000000 + number)
+
+
 def _error_text(error):
     if error is None:
         return "неизвестная ошибка"
@@ -230,12 +261,16 @@ def _first_field(java_object, names):
     return None, None
 
 
-def _delete_args(parameter_types, id_list, dialog_id):
-    """Подбирает аргументы MessagesController.deleteMessages по типам параметров."""
+def _delete_args(parameter_types, id_list, dialog_id, cache_only=False):
+    """Подбирает аргументы MessagesController.deleteMessages по типам параметров.
+
+    Порядок boolean-полей в клиенте — forAll, затем cacheOnly.
+    """
     arguments = []
     lists = 0
     longs = 0
     booleans = 0
+    has_cache_flag = sum(1 for p in parameter_types if str(p.getName()) == "boolean") >= 2
 
     for parameter in parameter_types:
         name = str(parameter.getName())
@@ -247,12 +282,20 @@ def _delete_args(parameter_types, id_list, dialog_id):
             arguments.append(Long(int(dialog_id)) if longs == 1 else Long(0))
         elif name == "boolean":
             booleans += 1
-            # Первый boolean — forAll, остальные (cacheOnly и подобные) выключены.
-            arguments.append(Boolean(booleans == 1))
+            if booleans == 1:
+                arguments.append(Boolean(not cache_only))
+            elif booleans == 2:
+                arguments.append(Boolean(cache_only))
+            else:
+                arguments.append(Boolean(False))
         elif name == "int":
             arguments.append(Integer(0))
         else:
             arguments.append(None)
+
+    if cache_only and not has_cache_flag:
+        # Без флага cacheOnly вызов ушёл бы на сервер — такую перегрузку пропускаем.
+        return None
 
     return arguments
 
@@ -400,6 +443,12 @@ class FilesCleanerPlugin(BasePlugin):
                 red=True,
                 on_click=lambda view=None: self._on_delete_click({}),
             ),
+            Text(
+                text="Починить вкладку «Файлы»",
+                subtext="Убрать из кэша посты, которых на сервере уже нет",
+                icon="msg_reset",
+                on_click=self._repair_click,
+            ),
             Selector(
                 key="target",
                 text="Что удалять",
@@ -453,13 +502,32 @@ class FilesCleanerPlugin(BasePlugin):
         return layout
 
     def _dialog_id(self, context):
+        # Поля самого экрана точнее контекста меню — берём их первыми.
+        layout = self._layout()
+        if layout is not None:
+            _, value = _first_field(layout, DIALOG_FIELDS)
+            if value:
+                normalized = _normalize_dialog(value)
+                if normalized:
+                    return normalized
+
+        fragment = get_last_fragment()
+        if fragment is not None:
+            _, value = _first_field(fragment, DIALOG_FIELDS)
+            if value:
+                normalized = _normalize_dialog(value)
+                if normalized:
+                    return normalized
+
         for key in ("dialog_id", "dialogId"):
             try:
                 value = (context or {}).get(key)
             except Exception:
                 value = None
             if value:
-                return int(value)
+                normalized = _normalize_dialog(value)
+                if normalized:
+                    return normalized
 
         try:
             chat = (context or {}).get("chat")
@@ -467,28 +535,9 @@ class FilesCleanerPlugin(BasePlugin):
             chat = None
         if chat is not None:
             try:
-                chat_id = int(get_private_field(chat, "id"))
-                return -(1000000000000 + chat_id) if chat_id > 0 else chat_id
+                return _normalize_dialog(int(get_private_field(chat, "id")))
             except Exception:
                 pass
-
-        layout = self._layout()
-        if layout is not None:
-            _, value = _first_field(layout, DIALOG_FIELDS)
-            if value:
-                try:
-                    return int(value)
-                except Exception:
-                    pass
-
-        fragment = get_last_fragment()
-        if fragment is not None:
-            _, value = _first_field(fragment, DIALOG_FIELDS)
-            if value:
-                try:
-                    return int(value)
-                except Exception:
-                    pass
         return None
 
     # ------------------------------------------------------------------
@@ -541,6 +590,27 @@ class FilesCleanerPlugin(BasePlugin):
             except Exception:
                 pass
         return request
+
+    def _resolve_dialog(self, dialog_id, target):
+        """Проверяет, какую запись id клиент вообще принимает."""
+        candidates = []
+        for value in (dialog_id, _bot_api_dialog(dialog_id)):
+            if value and value not in candidates:
+                candidates.append(value)
+
+        last_error = None
+        for candidate in candidates:
+            try:
+                response, error = self._request(self._search_page(candidate, target, 0))
+            except Exception as exception:
+                last_error = str(exception)
+                continue
+            if error is None:
+                return candidate, response
+            last_error = _error_text(error)
+            self._note("id %s не подошёл: %s" % (candidate, last_error))
+
+        raise RuntimeError("поиск не прошёл: %s" % (last_error or "неизвестно"))
 
     def _collect_ids(self, dialog_id, target, keep_ids):
         ids = []
@@ -596,7 +666,7 @@ class FilesCleanerPlugin(BasePlugin):
     # Удаление
     # ------------------------------------------------------------------
 
-    def _delete_via_controller(self, dialog_id, chunk):
+    def _delete_via_controller(self, dialog_id, chunk, cache_only=False):
         """Удаление руками клиента — он же чистит локальную базу и вкладки."""
         controller = get_messages_controller()
         id_list = ArrayList()
@@ -605,8 +675,12 @@ class FilesCleanerPlugin(BasePlugin):
 
         for method in _find_methods(controller, "deleteMessages"):
             try:
-                arguments = _delete_args(method.getParameterTypes(), id_list, dialog_id)
+                arguments = _delete_args(
+                    method.getParameterTypes(), id_list, dialog_id, cache_only
+                )
             except Exception:
+                continue
+            if arguments is None:
                 continue
             try:
                 _invoke(method, controller, arguments)
@@ -662,13 +736,17 @@ class FilesCleanerPlugin(BasePlugin):
             self._set_status("Собираю список…")
             self._quiet_bulletin("Собираю список, прогресс в настройках плагина")
 
+            dialog_id, probe = self._resolve_dialog(dialog_id, target)
+            server_total = getattr(probe, "count", None)
+            self._note("рабочий id %s, на сервере таких постов: %s" % (dialog_id, server_total))
+
             ids = self._collect_ids(dialog_id, target, keep_ids)
             self._note("найдено %d постов" % len(ids))
 
             if not ids:
                 self._busy = False
-                self._set_status("Нечего удалять")
-                run_on_ui_thread(lambda: BulletinHelper.show_info("Удалять нечего"))
+                self._set_status("На сервере таких постов нет")
+                run_on_ui_thread(lambda: self._offer_repair(dialog_id, target))
                 return
 
             self._set_status("Найдено %d — жду подтверждения" % len(ids))
@@ -722,6 +800,117 @@ class FilesCleanerPlugin(BasePlugin):
     def _cancel(self):
         self._busy = False
         self._set_status("Отменено")
+
+    # ------------------------------------------------------------------
+    # Призраки во вкладке: локальный кэш пережил удаление
+    # ------------------------------------------------------------------
+
+    def _offer_repair(self, dialog_id, target):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            BulletinHelper.show_info("Удалять нечего — на сервере таких постов нет")
+            return
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалять нечего")
+        builder.set_message(
+            "На сервере постов такого типа не осталось.\n\n"
+            "Если вкладка всё ещё показывает файлы — это устаревший локальный кэш "
+            "клиента. Могу вычистить из него записи о постах, которых на сервере нет: "
+            "сами посты уже удалены, трогаться будет только кэш."
+        )
+        builder.set_positive_button(
+            "Почистить кэш вкладки",
+            lambda b, w: (b.dismiss(), self._start_repair(dialog_id, target)),
+        )
+        builder.set_negative_button("Закрыть", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
+
+    def _repair_click(self, view=None):
+        if self._busy:
+            BulletinHelper.show_info("Подождите, идёт другая операция")
+            return
+        dialog_id = self._dialog_id({})
+        if not dialog_id:
+            BulletinHelper.show_error("Откройте канал, кэш которого чиним")
+            return
+        target = int(self.get_setting("target", TARGET_FILES) or 0)
+        self._start_repair(dialog_id, target)
+
+    def _start_repair(self, dialog_id, target):
+        self._busy = True
+        self._stop = False
+        self._quiet_bulletin("Чищу кэш вкладки")
+        threading.Thread(
+            target=self._repair_worker, args=(dialog_id, target), daemon=True
+        ).start()
+
+    def _cached_ids(self):
+        """Что показывает вкладка прямо сейчас."""
+        layout = self._layout()
+        if layout is None:
+            raise RuntimeError("откройте профиль канала и вкладку с медиа")
+        tab = self._tab(layout)
+        ids = []
+        for message in self._messages(layout, tab):
+            value = _call(message, "getId")
+            try:
+                ids.append(int(value))
+            except Exception:
+                continue
+        return ids
+
+    def _repair_worker(self, dialog_id, target):
+        try:
+            self._set_status("Читаю, что показывает вкладка…")
+            cached = self._cached_ids()
+            self._note("во вкладке показано %d элементов" % len(cached))
+
+            if not cached:
+                self._busy = False
+                self._set_status("Вкладка пуста — чистить нечего")
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Вкладка и так пуста"))
+                return
+
+            self._set_status("Сверяю с сервером…")
+            alive = set(self._collect_ids(dialog_id, target, set()))
+            ghosts = [value for value in cached if value not in alive]
+            self._note("на сервере живых %d, призраков %d" % (len(alive), len(ghosts)))
+
+            if not ghosts:
+                self._busy = False
+                self._set_status("Призраков нет, вкладка совпадает с сервером")
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_info("Кэш совпадает с сервером")
+                )
+                return
+
+            cleaned = 0
+            for start in range(0, len(ghosts), DELETE_CHUNK):
+                chunk = ghosts[start : start + DELETE_CHUNK]
+                if self._delete_via_controller(dialog_id, chunk, cache_only=True):
+                    cleaned += len(chunk)
+                else:
+                    self._note("пачку кэша вычистить не вышло")
+                self._set_status("Чищу кэш: %d из %d" % (cleaned, len(ghosts)))
+                time.sleep(0.2)
+
+            self._busy = False
+            self._note("кэш вычищен: %d записей" % cleaned)
+            self._set_status("Кэш вычищен: %d записей" % cleaned)
+            run_on_ui_thread(
+                lambda: BulletinHelper.show_success(
+                    "Убрано из кэша: %d. Перезайдите во вкладку" % cleaned
+                )
+            )
+        except Exception as exception:
+            message = str(exception)
+            self._note("чистка кэша сорвалась: %s" % message)
+            self._set_status("Ошибка чистки кэша: %s" % message)
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
 
     def _start_delete(self, dialog_id, ids):
         self._busy = True
