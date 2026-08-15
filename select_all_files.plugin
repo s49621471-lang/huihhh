@@ -241,6 +241,54 @@ def _messages_of(response):
     return _as_list(holder)
 
 
+def _field(java_object, name):
+    """Поле объекта: напрямую, иначе рефлексией."""
+    if java_object is None:
+        return None
+    try:
+        value = getattr(java_object, name)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    try:
+        return get_private_field(java_object, name)
+    except Exception:
+        return None
+
+
+def _peer_channel_id(peer):
+    """channel_id из TLRPC.Peer, если это канал или супергруппа."""
+    if peer is None:
+        return None
+    for name in ("channel_id", "chat_id"):
+        value = _field(peer, name)
+        if value:
+            try:
+                number = int(value)
+            except Exception:
+                continue
+            if number:
+                return abs(number)
+    return None
+
+
+def _source_channel(message):
+    """Откуда прилетел пост: id канала-источника или None."""
+    forward = _field(message, "fwd_from")
+    if forward is not None:
+        for name in ("from_id", "saved_from_peer", "saved_peer"):
+            channel_id = _peer_channel_id(_field(forward, name))
+            if channel_id:
+                return channel_id
+
+    # Автопост канала в обсуждении приходит от имени самого канала.
+    channel_id = _peer_channel_id(_field(message, "saved_from_peer"))
+    if channel_id:
+        return channel_id
+    return _peer_channel_id(_field(message, "from_id"))
+
+
 def _message_id(message):
     """id поста: поле, геттер или рефлексия — что сработает."""
     try:
@@ -359,6 +407,12 @@ class FilesCleanerPlugin(BasePlugin):
 
         entries = (
             ("Удалить все файлы", "msg_delete", "Фоном, пачками по 100", self._on_delete_click),
+            (
+                "Удалить репосты канала",
+                "msg_forward",
+                "Только пересланное из канала",
+                self._on_forwarded_click,
+            ),
             ("Выделить все", "msg_select", "Отметить открытую вкладку", self._on_select_click),
         )
         for menu_type in (MenuItemType.PROFILE_ACTION_MENU, MenuItemType.CHAT_ACTION_MENU):
@@ -486,6 +540,20 @@ class FilesCleanerPlugin(BasePlugin):
                 icon="msg_delete",
                 red=True,
                 on_click=lambda view=None: self._on_delete_click({}),
+            ),
+            Text(
+                text="Удалить репосты канала",
+                subtext="В чате обсуждений: только то, что прилетело из канала",
+                icon="msg_forward",
+                red=True,
+                on_click=lambda view=None: self._on_forwarded_click({}),
+            ),
+            Input(
+                key="source_channel",
+                text="Канал-источник",
+                default="",
+                subtext="Пусто — определю сам: по привязке чата, иначе по содержимому.",
+                icon="msg_channel",
             ),
             Text(
                 text="Починить вкладку «Файлы»",
@@ -657,7 +725,11 @@ class FilesCleanerPlugin(BasePlugin):
         raise RuntimeError("поиск не прошёл: %s" % (last_error or "неизвестно"))
 
     def _collect_ids(self, dialog_id, target, keep_ids):
-        ids = []
+        return [entry[0] for entry in self._collect_entries(dialog_id, target, keep_ids)]
+
+    def _collect_entries(self, dialog_id, target, keep_ids):
+        """Пары (id поста, id канала-источника) — источник None для своих сообщений."""
+        entries = []
         seen = set()
         offset_id = 0
 
@@ -695,7 +767,7 @@ class FilesCleanerPlugin(BasePlugin):
                 if message_id in seen or message_id in keep_ids:
                     continue
                 seen.add(message_id)
-                ids.append(message_id)
+                entries.append((message_id, _source_channel(message)))
 
             if unreadable:
                 self._note(
@@ -703,7 +775,7 @@ class FilesCleanerPlugin(BasePlugin):
                     % (unreadable, len(messages), _class_name(messages[0]))
                 )
 
-            self._set_status("Собираю список: найдено %d" % len(ids))
+            self._set_status("Собираю список: найдено %d" % len(entries))
 
             if len(messages) < PAGE_LIMIT:
                 break
@@ -712,8 +784,137 @@ class FilesCleanerPlugin(BasePlugin):
             offset_id = lowest
             time.sleep(PAGE_PAUSE)
 
-        ids.sort()
-        return ids
+        entries.sort(key=lambda item: item[0])
+        return entries
+
+    # ------------------------------------------------------------------
+    # Репосты канала в чате обсуждений
+    # ------------------------------------------------------------------
+
+    def _linked_channel(self, dialog_id):
+        """Канал, привязанный к этой группе обсуждений."""
+        controller = get_messages_controller()
+        chat_id = abs(int(dialog_id))
+        for arguments in ([Long(chat_id)], [Integer(chat_id)]):
+            full = _call(controller, "getChatFull", arguments)
+            if full is None:
+                continue
+            value = _field(full, "linked_chat_id")
+            try:
+                number = abs(int(value))
+            except Exception:
+                number = 0
+            if number:
+                return number
+        return None
+
+    def _on_forwarded_click(self, context=None):
+        if self._busy:
+            BulletinHelper.show_info("Уже работаю, прогресс в настройках")
+            return
+        dialog_id = self._dialog_id(context)
+        if not dialog_id:
+            BulletinHelper.show_error("Не понял, какой это чат — откройте его")
+            return
+        self._busy = True
+        self._stop = False
+        threading.Thread(
+            target=self._forwarded_job, args=(dialog_id,), daemon=True
+        ).start()
+
+    def _forwarded_job(self, dialog_id):
+        try:
+            target = int(self.get_setting("target", TARGET_FILES) or 0)
+            keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
+
+            self._note("чат %s, ищу репосты канала" % dialog_id)
+            self._set_status("Собираю список…")
+            self._quiet_bulletin("Ищу репосты канала, прогресс в настройках")
+
+            dialog_id, _ = self._resolve_dialog(dialog_id, target)
+            entries = self._collect_entries(dialog_id, target, keep_ids)
+            self._note("всего постов с вложениями в чате: %d" % len(entries))
+
+            wanted = _normalize_dialog(self.get_setting("source_channel", ""))
+            source = abs(wanted) if wanted else self._linked_channel(dialog_id)
+            if source:
+                self._note("канал-источник: %s" % source)
+
+            counts = {}
+            for _, channel_id in entries:
+                if channel_id:
+                    counts[channel_id] = counts.get(channel_id, 0) + 1
+
+            if not source and counts:
+                source = max(counts, key=lambda key: counts[key])
+                self._note("источник определён по содержимому чата: %s" % source)
+
+            if not source:
+                raise RuntimeError("не нашёл, из какого канала эти посты")
+
+            ids = [value for value, channel_id in entries if channel_id == source]
+            own = len(entries) - len(ids)
+            self._note("из канала %s: %d, чужих оставляю: %d" % (source, len(ids), own))
+
+            if not ids:
+                self._busy = False
+                self._set_status("Репостов канала не нашлось")
+                run_on_ui_thread(
+                    lambda: BulletinHelper.show_info(
+                        "Постов из канала здесь нет (всего с файлами: %d)" % len(entries)
+                    )
+                )
+                return
+
+            self._set_status("Найдено %d репостов — жду подтверждения" % len(ids))
+            run_on_ui_thread(
+                lambda: self._confirm_forwarded(dialog_id, ids, source, own, keep_ids)
+            )
+        except Exception as exception:
+            message = str(exception)
+            self._note("поиск репостов сорвался: %s" % message)
+            self._set_status("Ошибка: %s" % message)
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
+
+    def _confirm_forwarded(self, dialog_id, ids, source, own, keep_ids):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            self._busy = False
+            self._set_status("Некуда показать подтверждение")
+            return
+
+        preview = ", ".join("#%d" % value for value in ids[:12])
+        if len(ids) > 12:
+            preview += " …"
+
+        lines = [
+            "Репостов из канала %s: %d" % (source, len(ids)),
+            "Чужих постов с вложениями не трону: %d" % own,
+            "",
+            preview,
+        ]
+        if keep_ids:
+            lines.append("")
+            lines.append("Не трогаю также: %s" % ", ".join("#%d" % v for v in sorted(keep_ids)))
+        lines.append("")
+        lines.append("Удаление необратимо.")
+
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Удалить %d репостов?" % len(ids))
+        builder.set_message("\n".join(lines))
+        builder.set_positive_button(
+            "Удалить в фоне",
+            lambda b, w: (b.dismiss(), self._start_delete(dialog_id, ids)),
+        )
+        builder.set_negative_button("Отмена", lambda b, w: (b.dismiss(), self._cancel()))
+        builder.create()
+        builder.show()
+        try:
+            builder.make_button_red(AlertDialogBuilder.BUTTON_POSITIVE)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Удаление
