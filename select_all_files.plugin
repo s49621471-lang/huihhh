@@ -1,9 +1,9 @@
 """
-Выделить все — плагин для exteraGram.
+Чистка файлов — плагин для exteraGram.
 
-Добавляет в меню профиля канала пункт, который отмечает сразу все загруженные
-элементы открытой вкладки общих медиа («Файлы», «Медиа», «Музыка» и т.д.),
-чтобы дальше удалить их штатной корзиной Telegram.
+Кнопка «Удалить все файлы» в меню канала: собирает список постов с вложениями
+через API и удаляет их пачками в фоне, не мешая пользоваться клиентом.
+Прогресс и подробный лог живут в настройках плагина, лог копируется одним тапом.
 """
 
 import re
@@ -12,59 +12,36 @@ import time
 import traceback
 
 from java import jarray
-from java.lang import Integer, Object
+from java.lang import Boolean, Integer, Long, Object
 from java.lang.reflect import Array
+from java.util import ArrayList
 
 from org.telegram.tgnet import TLRPC
 
 from base_plugin import BasePlugin, MenuItemData, MenuItemType
-from android_utils import log, run_on_ui_thread
-from client_utils import get_last_fragment, get_messages_controller, send_request
+from android_utils import copy_to_clipboard, log, run_on_ui_thread
+from client_utils import (
+    get_last_fragment,
+    get_messages_controller,
+    get_user_config,
+    send_request,
+    send_text,
+)
 from hook_utils import get_private_field
 from ui.alert import AlertDialogBuilder
 from ui.bulletin import BulletinHelper
-from ui.settings import Divider, Header, Input, Switch, Text
+from ui.settings import Divider, Header, Input, Selector, Switch, Text
 
+# id не меняется, чтобы обновление вставало поверх прежней версии.
 __id__ = "select_all_files"
-__name__ = "Выделить все"
+__name__ = "Чистка файлов"
 __description__ = (
-    "Пункт «Выделить все» в меню канала: отмечает все загруженные элементы "
-    "открытой вкладки общих медиа, чтобы удалить их штатной корзиной."
+    "Кнопка «Удалить все файлы» в меню канала. Удаляет посты с вложениями пачками "
+    "в фоне; прогресс и лог — в настройках плагина."
 )
 __author__ = "ENI"
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 __icon__ = "exteraPlugins/1"
-
-DEFAULT_LIMIT = "100"
-
-# Индексы вкладок SharedMediaLayout в клиенте Telegram.
-TAB_NAMES = {
-    0: "Медиа",
-    1: "Файлы",
-    2: "Голосовые",
-    3: "Ссылки",
-    4: "Музыка",
-    5: "GIF",
-}
-
-LAYOUT_FIELDS = ("sharedMediaLayout", "mediaLayout", "sharedMediaLayoutView")
-DATA_FIELDS = ("sharedMediaData",)
-ADAPTER_FIELDS = (
-    "documentsAdapter",
-    "photoVideoAdapter",
-    "audioAdapter",
-    "voiceAdapter",
-    "linksAdapter",
-    "gifAdapter",
-)
-
-LIST_FIELDS = ("listView", "recyclerListView", "recyclerView")
-
-LOAD_ROUNDS = 40
-LOAD_PAUSE = 0.7
-LOAD_STALLS = 3
-
-DIALOG_FIELDS = ("dialog_id", "dialogId", "currentDialogId")
 
 KEEP_DEFAULT = "44"
 PAGE_LIMIT = 100
@@ -73,6 +50,24 @@ PAGE_PAUSE = 0.2
 CHUNK_PAUSE = 0.35
 MAX_PAGES = 500
 REQUEST_TIMEOUT = 45.0
+MAX_LOG_LINES = 400
+REPORT_CHUNK = 3800
+
+TAB_NAMES = {0: "Медиа", 1: "Файлы", 2: "Голосовые", 3: "Ссылки", 4: "Музыка", 5: "GIF"}
+
+TARGET_FILES = 0
+TARGET_MEDIA = 1
+TARGET_MUSIC = 2
+TARGET_VOICE = 3
+TARGET_GIF = 4
+
+LAYOUT_FIELDS = ("sharedMediaLayout", "mediaLayout", "sharedMediaLayoutView")
+DIALOG_FIELDS = ("dialog_id", "dialogId", "currentDialogId")
+
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
 
 
 def _parse_ids(raw):
@@ -105,40 +100,34 @@ def _flood_wait(error):
     return int(match.group(1)) if match else 0
 
 
-def _filter_for_tab(tab):
-    """Фильтр messages.search, соответствующий вкладке общих медиа."""
-    try:
-        if tab == 0:
-            return TLRPC.TL_inputMessagesFilterPhotoVideo()
-        if tab == 2:
-            return TLRPC.TL_inputMessagesFilterVoice()
-        if tab == 3:
-            return TLRPC.TL_inputMessagesFilterUrl()
-        if tab == 4:
-            return TLRPC.TL_inputMessagesFilterMusic()
-        if tab == 5:
-            return TLRPC.TL_inputMessagesFilterGif()
-        return TLRPC.TL_inputMessagesFilterDocument()
-    except Exception:
-        return None
+def _filter_for_target(target):
+    if target == TARGET_MEDIA:
+        return TLRPC.TL_inputMessagesFilterPhotoVideo()
+    if target == TARGET_MUSIC:
+        return TLRPC.TL_inputMessagesFilterMusic()
+    if target == TARGET_VOICE:
+        return TLRPC.TL_inputMessagesFilterVoice()
+    if target == TARGET_GIF:
+        return TLRPC.TL_inputMessagesFilterGif()
+    return TLRPC.TL_inputMessagesFilterDocument()
 
 
-def _parse_limit(raw, fallback=100):
-    try:
-        value = int(str(raw).strip())
-    except Exception:
-        return fallback
-    if value < 1:
-        return fallback
-    return value
+TARGET_NAMES = {
+    TARGET_FILES: "файлы",
+    TARGET_MEDIA: "фото и видео",
+    TARGET_MUSIC: "музыку",
+    TARGET_VOICE: "голосовые",
+    TARGET_GIF: "GIF",
+}
 
 
-def _find_method(java_object, name, argc):
-    """Ищет метод по имени и числу аргументов, поднимаясь по иерархии классов."""
+def _find_methods(java_object, name):
+    """Все методы с таким именем, от простых сигнатур к сложным."""
+    found = []
     try:
         clazz = java_object.getClass()
     except Exception:
-        return None
+        return found
 
     while clazz is not None:
         try:
@@ -149,21 +138,27 @@ def _find_method(java_object, name, argc):
             try:
                 if method.getName() != name:
                     continue
-                if len(method.getParameterTypes()) != argc:
-                    continue
                 method.setAccessible(True)
-                return method
+                found.append(method)
             except Exception:
                 continue
         try:
             clazz = clazz.getSuperclass()
         except Exception:
-            return None
+            break
+
+    found.sort(key=lambda item: len(item.getParameterTypes()))
+    return found
+
+
+def _find_method(java_object, name, argc):
+    for method in _find_methods(java_object, name):
+        if len(method.getParameterTypes()) == argc:
+            return method
     return None
 
 
 def _invoke(method, target, arguments):
-    """Method.invoke с varargs, с запасным вариантом через явный jarray."""
     try:
         return method.invoke(target, *arguments)
     except TypeError:
@@ -173,27 +168,7 @@ def _invoke(method, target, arguments):
         return method.invoke(target, boxed)
 
 
-def _class_name(value):
-    try:
-        return str(value.getClass().getName())
-    except Exception:
-        return type(value).__name__
-
-
-def _array_get(java_array, index):
-    """Элемент Java-массива, полученного рефлексией (его статический тип — Object)."""
-    try:
-        return java_array[index]
-    except Exception:
-        pass
-    try:
-        return Array.get(java_array, index)
-    except Exception:
-        return None
-
-
 def _call(java_object, name, arguments=()):
-    """Вызов метода: сначала напрямую, иначе через рефлексию по реальному классу."""
     if java_object is None:
         return None
     try:
@@ -209,26 +184,32 @@ def _call(java_object, name, arguments=()):
         return None
 
 
-def _as_list(value):
-    """Читает java.util.List, даже если рефлексия вернула его как Object."""
-    if value is None:
+def _array_get(java_array, index):
+    try:
+        return java_array[index]
+    except Exception:
+        pass
+    try:
+        return Array.get(java_array, index)
+    except Exception:
         return None
 
+
+def _as_list(value):
+    if value is None:
+        return None
     try:
         return list(value)
     except Exception:
         pass
-
     size_method = _find_method(value, "size", 0)
     get_method = _find_method(value, "get", 1)
     if size_method is None or get_method is None:
         return None
-
     try:
         count = int(_invoke(size_method, value, []))
     except Exception:
         return None
-
     items = []
     for index in range(count):
         try:
@@ -236,27 +217,6 @@ def _as_list(value):
         except Exception:
             continue
     return items
-
-
-def _sparse_size(sparse):
-    method = _find_method(sparse, "size", 0)
-    if method is None:
-        return 0
-    try:
-        return int(_invoke(method, sparse, []))
-    except Exception:
-        return 0
-
-
-def _sparse_put(sparse, key, value):
-    method = _find_method(sparse, "put", 2)
-    if method is None:
-        return False
-    try:
-        _invoke(method, sparse, [Integer(int(key)), value])
-        return True
-    except Exception:
-        return False
 
 
 def _first_field(java_object, names):
@@ -270,22 +230,52 @@ def _first_field(java_object, names):
     return None, None
 
 
-class SelectAllPlugin(BasePlugin):
+def _delete_args(parameter_types, id_list, dialog_id):
+    """Подбирает аргументы MessagesController.deleteMessages по типам параметров."""
+    arguments = []
+    lists = 0
+    longs = 0
+    booleans = 0
+
+    for parameter in parameter_types:
+        name = str(parameter.getName())
+        if name in ("java.util.ArrayList", "java.util.List"):
+            lists += 1
+            arguments.append(id_list if lists == 1 else None)
+        elif name == "long":
+            longs += 1
+            arguments.append(Long(int(dialog_id)) if longs == 1 else Long(0))
+        elif name == "boolean":
+            booleans += 1
+            # Первый boolean — forAll, остальные (cacheOnly и подобные) выключены.
+            arguments.append(Boolean(booleans == 1))
+        elif name == "int":
+            arguments.append(Integer(0))
+        else:
+            arguments.append(None)
+
+    return arguments
+
+
+# ---------------------------------------------------------------------------
+# Плагин
+# ---------------------------------------------------------------------------
+
+
+class FilesCleanerPlugin(BasePlugin):
     def on_plugin_load(self):
         self._items = []
         self._busy = False
-        self._dialog = None
+        self._stop = False
+        self._logs = []
+        self._status = self.get_setting("status_line", "Ничего не запускалось")
 
         entries = (
-            ("Удалить все файлы", "msg_delete", "Найти и удалить пачками по 100", self._on_delete_click, 7),
-            ("Выделить все", "msg_select", "Отметить всё на открытой вкладке", self._on_click, 6),
+            ("Удалить все файлы", "msg_delete", "Фоном, пачками по 100", self._on_delete_click),
+            ("Выделить все", "msg_select", "Отметить открытую вкладку", self._on_select_click),
         )
-
-        for menu_type in (
-            MenuItemType.PROFILE_ACTION_MENU,
-            MenuItemType.CHAT_ACTION_MENU,
-        ):
-            for text, icon, subtext, handler, priority in entries:
+        for menu_type in (MenuItemType.PROFILE_ACTION_MENU, MenuItemType.CHAT_ACTION_MENU):
+            for text, icon, subtext, handler in entries:
                 try:
                     item_id = self.add_menu_item(
                         MenuItemData(
@@ -294,16 +284,17 @@ class SelectAllPlugin(BasePlugin):
                             icon=icon,
                             subtext=subtext,
                             on_click=handler,
-                            priority=priority,
+                            priority=7,
                         )
                     )
                     if item_id:
                         self._items.append(item_id)
                 except Exception:
-                    log("[select_all_files] меню не добавлено:\n" + traceback.format_exc())
+                    log("[files_cleaner] меню не добавлено:\n" + traceback.format_exc())
         self.log("плагин загружен")
 
     def on_plugin_unload(self):
+        self._stop = True
         for item_id in self._items:
             try:
                 self.remove_menu_item(item_id)
@@ -312,18 +303,109 @@ class SelectAllPlugin(BasePlugin):
         self._items = []
 
     # ------------------------------------------------------------------
+    # Лог и статус
+    # ------------------------------------------------------------------
+
+    def _note(self, line):
+        stamp = time.strftime("%H:%M:%S")
+        entry = "%s  %s" % (stamp, line)
+        self._logs.append(entry)
+        if len(self._logs) > MAX_LOG_LINES:
+            del self._logs[: len(self._logs) - MAX_LOG_LINES]
+        log("[files_cleaner] " + line)
+
+    def _set_status(self, text, redraw=True):
+        self._status = text
+        try:
+            self.set_setting("status_line", text, reload_settings=redraw)
+        except Exception:
+            pass
+
+    def _log_text(self):
+        if not self._logs:
+            return "Лог пуст"
+        return "\n".join(self._logs)
+
+    def _copy_logs(self, view=None):
+        copy_to_clipboard(self._log_text())
+
+    def _logs_to_saved(self, view=None):
+        text = self._log_text()
+
+        def worker():
+            try:
+                self_id = get_user_config().getClientUserId()
+                for start in range(0, len(text), REPORT_CHUNK):
+                    send_text(self_id, text[start : start + REPORT_CHUNK])
+                    time.sleep(0.2)
+                run_on_ui_thread(lambda: BulletinHelper.show_success("Лог в «Избранном»"))
+            except Exception:
+                log("[files_cleaner] лог не ушёл:\n" + traceback.format_exc())
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Не отправился"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _clear_logs(self, view=None):
+        self._logs = []
+        self._set_status(self._status)
+        BulletinHelper.show_info("Лог очищен")
+
+    def _stop_work(self, view=None):
+        if not self._busy:
+            BulletinHelper.show_info("Сейчас ничего не идёт")
+            return
+        self._stop = True
+        BulletinHelper.show_info("Остановлю после текущей пачки")
+
+    # ------------------------------------------------------------------
     # Настройки
     # ------------------------------------------------------------------
 
+    def _log_page(self):
+        items = [Header(text="Лог")]
+        lines = self._logs[-120:] if self._logs else ["Пусто"]
+        for line in reversed(lines):
+            items.append(Text(text=line))
+        items.append(Divider())
+        items.append(
+            Text(text="Скопировать весь лог", icon="msg_copy", accent=True, on_click=self._copy_logs)
+        )
+        return items
+
     def create_settings(self):
+        running = self._busy
         return [
-            Header(text="Удаление очередью"),
+            Header(text="Состояние"),
+            Text(
+                text=self._status,
+                icon="msg_info",
+                subtext="Обновляется по ходу работы",
+            ),
+            Text(
+                text="Остановить" if running else "Открыть лог",
+                icon="msg_cancel" if running else "msg_log",
+                red=running,
+                on_click=self._stop_work if running else None,
+                create_sub_fragment=None if running else self._log_page,
+            ),
+            Text(text="Скопировать лог", icon="msg_copy", on_click=self._copy_logs),
+            Text(text="Лог в «Избранное»", icon="msg_saved", on_click=self._logs_to_saved),
+            Text(text="Очистить лог", icon="msg_clear", on_click=self._clear_logs),
+            Divider(),
+            Header(text="Удаление"),
             Text(
                 text="Удалить все файлы",
-                subtext="Найдёт всё через API и удалит пачками по 100",
+                subtext="Спросит подтверждение и уйдёт работать в фон",
                 icon="msg_delete",
                 red=True,
                 on_click=lambda view=None: self._on_delete_click({}),
+            ),
+            Selector(
+                key="target",
+                text="Что удалять",
+                default=TARGET_FILES,
+                items=["Файлы (документы)", "Фото и видео", "Музыку", "Голосовые", "GIF"],
+                icon="msg_media",
             ),
             Input(
                 key="keep_ids",
@@ -332,280 +414,45 @@ class SelectAllPlugin(BasePlugin):
                 subtext="ID через запятую. Можно вставлять ссылки вида t.me/c/2053026588/44.",
                 icon="msg_pin",
             ),
+            Switch(
+                key="silent",
+                text="Не отвлекать уведомлениями",
+                default=False,
+                subtext="Всплывающие подсказки по ходу работы отключаются, прогресс остаётся здесь.",
+                icon="msg_mute",
+            ),
             Divider(
                 text=(
-                    "Прокрутка не нужна: список берётся с сервера целиком, удаление идёт "
-                    "подряд с прогрессом. Перед удалением показывается, сколько нашлось."
+                    "Прокручивать и выделять ничего не нужно: список берётся с сервера, "
+                    "удаление идёт пачками по 100 в фоне. Клиентом можно пользоваться."
                 )
             ),
-            Header(text="Выделение"),
-            Input(
-                key="limit",
-                text="Максимум за раз",
-                default=DEFAULT_LIMIT,
-                subtext="Штатный предел Telegram — 100. Больше можно, но клиент к этому не готов.",
-                icon="msg_limit_hit",
-            ),
-            Switch(
-                key="show_total",
-                text="Показывать, сколько всего и сколько останется",
-                default=True,
-                subtext="Общее число берётся с сервера, поэтому видно реальный остаток.",
-                icon="msg_info",
-            ),
-            Switch(
-                key="auto_load",
-                text="Докручивать список сам",
-                default=True,
-                subtext=(
-                    "Плагин сам прокручивает вкладку вниз, пока клиент не подгрузит "
-                    "нужное количество. Иначе отмечается только видимое."
-                ),
-                icon="msg_download",
-            ),
-            Switch(
-                key="force",
-                text="Обходить проверки клиента",
-                default=False,
-                subtext=(
-                    "Писать выделение напрямую, минуя ограничения. Нужно, если обычный "
-                    "способ не сработал: зажмите любой файл, потом жмите «Выделить все»."
-                ),
-                icon="msg_warning",
-            ),
-            Divider(),
+            Header(text="Ручное выделение"),
             Text(
                 text="Выделить все на открытой вкладке",
                 icon="msg_select",
-                accent=True,
-                on_click=lambda view=None: self._on_click({}),
+                on_click=lambda view=None: self._on_select_click({}),
             ),
             Divider(
                 text=(
-                    "Откройте канал → вкладку «Файлы», прокрутите список настолько, "
-                    "насколько хотите выделить, и нажмите «Выделить все». Отмечаются "
-                    "только подгруженные элементы: докрутите ниже и повторите."
+                    "Запасной способ: отмечает загруженные элементы вкладки, дальше "
+                    "штатная корзина. Telegram отмечает не больше сотни за раз."
                 )
             ),
         ]
 
     # ------------------------------------------------------------------
-    # Поиск нужных объектов в клиенте
+    # Определение канала
     # ------------------------------------------------------------------
 
     def _layout(self):
         fragment = get_last_fragment()
         if fragment is None:
-            raise RuntimeError("нет открытого экрана")
-
-        name, layout = _first_field(fragment, LAYOUT_FIELDS)
-        if layout is None:
-            raise RuntimeError(
-                "на этом экране нет общих медиа — откройте профиль канала и вкладку «Файлы»"
-            )
-        log("[select_all_files] layout найден в поле %s" % name)
+            return None
+        _, layout = _first_field(fragment, LAYOUT_FIELDS)
         return layout
 
-    def _tab(self, layout):
-        for method_name in ("getSelectedTab", "getClosestTab"):
-            method = _find_method(layout, method_name, 0)
-            if method is None:
-                continue
-            try:
-                return int(_invoke(method, layout, []))
-            except Exception:
-                continue
-
-        value = get_private_field(layout, "selectedTab")
-        if value is not None:
-            try:
-                return int(value)
-            except Exception:
-                pass
-        return 1
-
-    def _messages(self, layout, tab):
-        name, data = _first_field(layout, DATA_FIELDS)
-        if data is None:
-            raise RuntimeError("не нашёл список медиа в этом окне")
-
-        bucket = _array_get(data, tab)
-        if bucket is None:
-            raise RuntimeError("вкладка «%s» ещё не загружена" % TAB_NAMES.get(tab, tab))
-
-        messages = None
-        for field in ("messages", "messagesList"):
-            try:
-                messages = get_private_field(bucket, field)
-            except Exception:
-                messages = None
-            if messages is not None:
-                break
-
-        if messages is None:
-            raise RuntimeError("не нашёл сообщения вкладки «%s»" % TAB_NAMES.get(tab, tab))
-
-        items = _as_list(messages)
-        if items is None:
-            raise RuntimeError(
-                "список сообщений не читается (%s)" % _class_name(messages)
-            )
-        log(
-            "[select_all_files] вкладка %s: поле %s, список %s, элементов %d"
-            % (tab, name, _class_name(messages), len(items))
-        )
-        return items
-
-    def _selected_count(self, layout):
-        selected = get_private_field(layout, "selectedFiles")
-        if selected is None:
-            return 0
-        total = 0
-        for index in (0, 1):
-            bucket = _array_get(selected, index)
-            if bucket is None:
-                continue
-            total += _sparse_size(bucket)
-        return total
-
-    # ------------------------------------------------------------------
-    # Само выделение
-    # ------------------------------------------------------------------
-
-    def _enter_selection(self, layout, tab, messages):
-        """Включает штатный режим выделения длинным нажатием по первому элементу."""
-        long_click = _find_method(layout, "onItemLongClick", 3)
-        if long_click is None:
-            return False
-        before = self._selected_count(layout)
-        try:
-            _invoke(long_click, layout, [messages[0], None, Integer(int(tab))])
-        except Exception:
-            log("[select_all_files] onItemLongClick упал:\n" + traceback.format_exc())
-            return False
-        return self._selected_count(layout) > before
-
-    def _select_standard(self, layout, tab, messages, limit):
-        """Штатный путь: клики по элементам после включённого режима выделения."""
-        item_click = _find_method(layout, "onItemClick", 5)
-        if item_click is None:
-            return None
-
-        selected = 1
-        for index in range(1, min(len(messages), limit)):
-            try:
-                _invoke(
-                    item_click,
-                    layout,
-                    [
-                        Integer(int(index)),
-                        None,
-                        messages[index],
-                        Integer(int(tab)),
-                        Integer(int(tab)),
-                    ],
-                )
-                selected += 1
-            except Exception:
-                log("[select_all_files] пропуск элемента %d:\n%s" % (index, traceback.format_exc()))
-
-        return selected
-
-    def _select_forced(self, layout, messages, limit):
-        """Запасной путь: запись прямо в selectedFiles, режим выделения уже должен быть включён."""
-        selected = get_private_field(layout, "selectedFiles")
-        if selected is None:
-            raise RuntimeError("не нашёл список выделенного (selectedFiles)")
-
-        bucket = _array_get(selected, 0)
-        if bucket is None:
-            raise RuntimeError(
-                "не читается selectedFiles (%s)" % _class_name(selected)
-            )
-
-        added = 0
-        for message in messages[:limit]:
-            message_id = _call(message, "getId")
-            if message_id is None:
-                continue
-            try:
-                message_id = int(message_id)
-            except Exception:
-                continue
-            if _sparse_put(bucket, message_id, message):
-                added += 1
-
-        self._refresh(layout)
-        return added
-
-    def _refresh(self, layout):
-        for field in ADAPTER_FIELDS:
-            try:
-                adapter = get_private_field(layout, field)
-            except Exception:
-                adapter = None
-            if adapter is None:
-                continue
-            _call(adapter, "notifyDataSetChanged")
-        _call(layout, "invalidate")
-
-    # ------------------------------------------------------------------
-    # Догрузка списка
-    # ------------------------------------------------------------------
-
-    def _list_views(self, layout):
-        """RecyclerView'ы вкладок — их прокрутка заставляет клиент подгружать медиа."""
-        views = []
-        pages = get_private_field(layout, "mediaPages")
-        if pages is None:
-            return views
-        for index in range(2):
-            page = _array_get(pages, index)
-            if page is None:
-                continue
-            _, view = _first_field(page, LIST_FIELDS)
-            if view is not None:
-                views.append(view)
-        return views
-
-    def _load_more(self, layout, tab, limit):
-        """Прокручивает список вниз, пока клиент подгружает новые элементы."""
-        views = self._list_views(layout)
-        if not views:
-            log("[select_all_files] не нашёл списки вкладок, догрузка пропущена")
-            return self._messages(layout, tab)
-
-        messages = self._messages(layout, tab)
-        stalls = 0
-
-        for _ in range(LOAD_ROUNDS):
-            if len(messages) >= limit:
-                break
-
-            position = max(len(messages) - 1, 0)
-            for view in views:
-                run_on_ui_thread(
-                    lambda v=view, p=position: _call(v, "scrollToPosition", [Integer(int(p))])
-                )
-
-            time.sleep(LOAD_PAUSE)
-
-            grown = self._messages(layout, tab)
-            if len(grown) <= len(messages):
-                stalls += 1
-                if stalls >= LOAD_STALLS:
-                    break
-            else:
-                stalls = 0
-            messages = grown
-
-        return messages
-
-    # ------------------------------------------------------------------
-    # Сколько всего таких постов в канале
-    # ------------------------------------------------------------------
-
-    def _dialog_id(self, layout, context):
+    def _dialog_id(self, context):
         for key in ("dialog_id", "dialogId"):
             try:
                 value = (context or {}).get(key)
@@ -614,81 +461,38 @@ class SelectAllPlugin(BasePlugin):
             if value:
                 return int(value)
 
-        _, value = _first_field(layout, DIALOG_FIELDS)
-        if value:
+        try:
+            chat = (context or {}).get("chat")
+        except Exception:
+            chat = None
+        if chat is not None:
             try:
-                return int(value)
+                chat_id = int(get_private_field(chat, "id"))
+                return -(1000000000000 + chat_id) if chat_id > 0 else chat_id
             except Exception:
                 pass
 
-        try:
-            chat = (context or {}).get("chat")
-            if chat is not None:
-                chat_id = int(_call(chat, "getId") or get_private_field(chat, "id"))
-                return -(1000000000000 + chat_id) if chat_id > 0 else chat_id
-        except Exception:
-            pass
-        return None
-
-    def _total_in_channel(self, dialog_id, tab):
-        """Общее число постов такого типа — счётчик отдаёт сам сервер."""
-        if not dialog_id:
-            return None
-
-        media_filter = _filter_for_tab(tab)
-        if media_filter is None:
-            return None
-
-        try:
-            request = TLRPC.TL_messages_search()
-            request.peer = get_messages_controller().getInputPeer(dialog_id)
-            request.q = ""
-            request.filter = media_filter
-            request.min_date = 0
-            request.max_date = 0
-            request.offset_id = 0
-            request.add_offset = 0
-            request.limit = 1
-            request.max_id = 0
-            request.min_id = 0
-            for field in ("hash", "hash_"):
+        layout = self._layout()
+        if layout is not None:
+            _, value = _first_field(layout, DIALOG_FIELDS)
+            if value:
                 try:
-                    setattr(request, field, 0)
+                    return int(value)
                 except Exception:
                     pass
-        except Exception:
-            log("[select_all_files] запрос счётчика не собрался:\n" + traceback.format_exc())
-            return None
 
-        box = {}
-        event = threading.Event()
-
-        def callback(response, error):
-            box["response"] = response
-            box["error"] = error
-            event.set()
-
-        send_request(request, callback)
-        if not event.wait(20):
-            return None
-
-        response = box.get("response")
-        if response is None:
-            return None
-
-        count = getattr(response, "count", None)
-        if not count:
-            try:
-                count = len(list(response.messages))
-            except Exception:
-                count = None
-        try:
-            return int(count)
-        except Exception:
-            return None
+        fragment = get_last_fragment()
+        if fragment is not None:
+            _, value = _first_field(fragment, DIALOG_FIELDS)
+            if value:
+                try:
+                    return int(value)
+                except Exception:
+                    pass
+        return None
 
     # ------------------------------------------------------------------
-    # Удаление очередью: всё через API, без прокрутки и без корзины
+    # Запросы
     # ------------------------------------------------------------------
 
     def _request(self, request, timeout=REQUEST_TIMEOUT):
@@ -715,14 +519,15 @@ class SelectAllPlugin(BasePlugin):
             last = error
             if wait <= 0 or wait > 300:
                 return None, error
+            self._note("флуд-контроль, жду %d с" % wait)
             time.sleep(wait + 1)
         return None, last
 
-    def _search_page(self, dialog_id, tab, offset_id):
+    def _search_page(self, dialog_id, target, offset_id):
         request = TLRPC.TL_messages_search()
         request.peer = get_messages_controller().getInputPeer(dialog_id)
         request.q = ""
-        request.filter = _filter_for_tab(tab)
+        request.filter = _filter_for_target(target)
         request.min_date = 0
         request.max_date = 0
         request.offset_id = offset_id
@@ -737,18 +542,21 @@ class SelectAllPlugin(BasePlugin):
                 pass
         return request
 
-    def _collect_ids(self, dialog_id, tab, keep_ids):
-        """Все id постов такого типа — постранично, минуя интерфейс."""
+    def _collect_ids(self, dialog_id, target, keep_ids):
         ids = []
         seen = set()
         offset_id = 0
 
-        for _ in range(MAX_PAGES):
+        for page in range(MAX_PAGES):
+            if self._stop:
+                self._note("сбор прерван вручную")
+                break
+
             response, error = self._request_retrying(
-                self._search_page(dialog_id, tab, offset_id)
+                self._search_page(dialog_id, target, offset_id)
             )
             if error is not None:
-                raise RuntimeError("Ошибка поиска: %s" % _error_text(error))
+                raise RuntimeError("поиск не прошёл: %s" % _error_text(error))
             if response is None:
                 break
 
@@ -772,7 +580,7 @@ class SelectAllPlugin(BasePlugin):
                 seen.add(message_id)
                 ids.append(message_id)
 
-            self._update_progress("Собираю список", "Найдено: %d" % len(ids))
+            self._set_status("Собираю список: найдено %d" % len(ids))
 
             if len(messages) < PAGE_LIMIT:
                 break
@@ -784,7 +592,30 @@ class SelectAllPlugin(BasePlugin):
         ids.sort()
         return ids
 
-    def _delete_request(self, dialog_id, chunk):
+    # ------------------------------------------------------------------
+    # Удаление
+    # ------------------------------------------------------------------
+
+    def _delete_via_controller(self, dialog_id, chunk):
+        """Удаление руками клиента — он же чистит локальную базу и вкладки."""
+        controller = get_messages_controller()
+        id_list = ArrayList()
+        for message_id in chunk:
+            id_list.add(Integer(int(message_id)))
+
+        for method in _find_methods(controller, "deleteMessages"):
+            try:
+                arguments = _delete_args(method.getParameterTypes(), id_list, dialog_id)
+            except Exception:
+                continue
+            try:
+                _invoke(method, controller, arguments)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _delete_via_api(self, dialog_id, chunk):
         peer = get_messages_controller().getInputPeer(dialog_id)
         if isinstance(peer, TLRPC.TL_inputPeerChannel):
             request = TLRPC.TL_channels_deleteMessages()
@@ -797,90 +628,90 @@ class SelectAllPlugin(BasePlugin):
             request.revoke = True
         for message_id in chunk:
             request.id.add(Integer(int(message_id)))
-        return request
+
+        response, error = self._request_retrying(request)
+        if error is not None:
+            raise RuntimeError(_error_text(error))
+        return True
 
     def _on_delete_click(self, context=None):
         if self._busy:
-            BulletinHelper.show_info("Подождите, операция уже идёт")
+            BulletinHelper.show_info("Уже работаю, прогресс в настройках")
             return
+
+        dialog_id = self._dialog_id(context)
+        if not dialog_id:
+            BulletinHelper.show_error("Не понял, какой это канал — откройте его")
+            return
+        if dialog_id >= 0:
+            BulletinHelper.show_error("Работаю только с каналами и группами")
+            return
+
         self._busy = True
-        threading.Thread(target=self._delete_job, args=(context,), daemon=True).start()
+        self._stop = False
+        threading.Thread(
+            target=self._prepare_job, args=(dialog_id,), daemon=True
+        ).start()
 
-    def _delete_job(self, context):
+    def _prepare_job(self, dialog_id):
         try:
-            layout = None
-            tab = 1
-            try:
-                layout = self._layout()
-                tab = self._tab(layout)
-            except Exception:
-                log("[select_all_files] экрана медиа нет, беру вкладку «Файлы»")
-
-            dialog_id = self._dialog_id(layout, context)
-            if not dialog_id:
-                raise RuntimeError("не понял, какой это канал — откройте его профиль")
-
+            target = int(self.get_setting("target", TARGET_FILES) or 0)
             keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
-            self._show_progress("Собираю список", "Найдено: 0")
-            ids = self._collect_ids(dialog_id, tab, keep_ids)
-            self._dismiss_progress()
 
-            run_on_ui_thread(lambda: self._confirm_delete(dialog_id, tab, ids, keep_ids))
+            self._note("канал %s, ищу %s" % (dialog_id, TARGET_NAMES.get(target, "файлы")))
+            self._set_status("Собираю список…")
+            self._quiet_bulletin("Собираю список, прогресс в настройках плагина")
+
+            ids = self._collect_ids(dialog_id, target, keep_ids)
+            self._note("найдено %d постов" % len(ids))
+
+            if not ids:
+                self._busy = False
+                self._set_status("Нечего удалять")
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Удалять нечего"))
+                return
+
+            self._set_status("Найдено %d — жду подтверждения" % len(ids))
+            run_on_ui_thread(lambda: self._confirm(dialog_id, ids, keep_ids))
         except Exception as exception:
-            log("[select_all_files] сбор не удался:\n" + traceback.format_exc())
             message = str(exception)
-            self._dismiss_progress()
+            self._note("сбор сорвался: %s" % message)
+            self._set_status("Ошибка: %s" % message)
             self._busy = False
             run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
 
-    def _confirm_delete(self, dialog_id, tab, ids, keep_ids):
-        self._busy = False
+    def _confirm(self, dialog_id, ids, keep_ids):
         fragment = get_last_fragment()
         activity = fragment.getParentActivity() if fragment else None
-
-        if not ids:
-            if activity is None:
-                BulletinHelper.show_info("Удалять нечего")
-                return
-            builder = AlertDialogBuilder(activity)
-            builder.set_title("Нечего удалять")
-            builder.set_message(
-                "На вкладке «%s» постов не нашлось." % TAB_NAMES.get(tab, tab)
-            )
-            builder.set_positive_button("Ок", lambda b, w: b.dismiss())
-            builder.show()
-            return
-
         if activity is None:
-            BulletinHelper.show_error("Нет активного окна для подтверждения")
+            self._busy = False
+            self._set_status("Некуда показать подтверждение")
             return
 
         preview = ", ".join("#%d" % value for value in ids[:12])
         if len(ids) > 12:
             preview += " …"
 
-        message = [
+        lines = [
             "Постов к удалению: %d" % len(ids),
-            "Пачками по %d, подряд, без ручного выделения." % DELETE_CHUNK,
+            "Пачками по %d, в фоне." % DELETE_CHUNK,
             "",
             preview,
         ]
         if keep_ids:
-            message.append("")
-            message.append(
-                "Не трогаю: %s" % ", ".join("#%d" % value for value in sorted(keep_ids))
-            )
-        message.append("")
-        message.append("Удаление в канале необратимо.")
+            lines.append("")
+            lines.append("Не трогаю: %s" % ", ".join("#%d" % v for v in sorted(keep_ids)))
+        lines.append("")
+        lines.append("Удаление в канале необратимо.")
 
         builder = AlertDialogBuilder(activity)
         builder.set_title("Удалить %d постов?" % len(ids))
-        builder.set_message("\n".join(message))
+        builder.set_message("\n".join(lines))
         builder.set_positive_button(
-            "Удалить всё",
+            "Удалить в фоне",
             lambda b, w: (b.dismiss(), self._start_delete(dialog_id, ids)),
         )
-        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.set_negative_button("Отмена", lambda b, w: (b.dismiss(), self._cancel()))
         builder.create()
         builder.show()
         try:
@@ -888,13 +719,14 @@ class SelectAllPlugin(BasePlugin):
         except Exception:
             pass
 
+    def _cancel(self):
+        self._busy = False
+        self._set_status("Отменено")
+
     def _start_delete(self, dialog_id, ids):
         self._busy = True
-        self._show_progress(
-            "Удаляю 0 из %d" % len(ids),
-            "Осталось: %d\nНе удалось: 0" % len(ids),
-            determinate=True,
-        )
+        self._stop = False
+        self._quiet_bulletin("Удаляю в фоне — прогресс в настройках плагина")
         threading.Thread(
             target=self._delete_worker, args=(dialog_id, ids), daemon=True
         ).start()
@@ -902,180 +734,167 @@ class SelectAllPlugin(BasePlugin):
     def _delete_worker(self, dialog_id, ids):
         deleted = 0
         failed = []
+        total = len(ids)
+        started = time.time()
+
         try:
-            for start in range(0, len(ids), DELETE_CHUNK):
+            for start in range(0, total, DELETE_CHUNK):
+                if self._stop:
+                    self._note("остановлено вручную на %d из %d" % (deleted, total))
+                    break
+
                 chunk = ids[start : start + DELETE_CHUNK]
-                response, error = self._request_retrying(
-                    self._delete_request(dialog_id, chunk)
-                )
-                if error is not None:
-                    failed.extend(chunk)
-                    log("[select_all_files] пачка не удалена (%s)" % _error_text(error))
-                else:
+                if self._delete_via_controller(dialog_id, chunk):
                     deleted += len(chunk)
+                else:
+                    try:
+                        self._delete_via_api(dialog_id, chunk)
+                        deleted += len(chunk)
+                        self._note("пачка ушла напрямую через API")
+                    except Exception as chunk_error:
+                        failed.extend(chunk)
+                        self._note("пачка не удалилась: %s" % chunk_error)
 
                 done = deleted + len(failed)
-                self._update_progress(
-                    "Удаляю %d из %d" % (deleted, len(ids)),
-                    "Осталось: %d\nНе удалось: %d" % (len(ids) - done, len(failed)),
-                    percent=int(done * 100 / max(len(ids), 1)),
+                self._set_status(
+                    "Удалено %d из %d · осталось %d · ошибок %d"
+                    % (deleted, total, total - done, len(failed))
                 )
-                if start + DELETE_CHUNK < len(ids):
+                if start + DELETE_CHUNK < total:
                     time.sleep(CHUNK_PAUSE)
         except Exception as exception:
-            log("[select_all_files] удаление сорвалось:\n" + traceback.format_exc())
-            message = str(exception)
-            self._dismiss_progress()
+            self._note("удаление сорвалось: %s" % traceback.format_exc().splitlines()[-1])
+            self._set_status("Сбой на %d из %d: %s" % (deleted, total, exception))
             self._busy = False
-            run_on_ui_thread(lambda: BulletinHelper.show_error("Сбой: %s" % message))
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Сбой удаления"))
             return
 
-        self._dismiss_progress()
+        spent = int(time.time() - started)
         self._busy = False
-        run_on_ui_thread(lambda: self._delete_result(deleted, failed, len(ids)))
-
-    def _delete_result(self, deleted, failed, total):
-        fragment = get_last_fragment()
-        activity = fragment.getParentActivity() if fragment else None
-        if activity is None:
-            BulletinHelper.show_success("Удалено %d из %d" % (deleted, total))
-            return
-
-        lines = ["Удалено: %d из %d" % (deleted, total), "Не удалось: %d" % len(failed)]
+        self._note("готово: удалено %d, ошибок %d, за %d с" % (deleted, len(failed), spent))
         if failed:
-            preview = ", ".join("#%d" % value for value in failed[:15])
-            if len(failed) > 15:
-                preview += " …"
-            lines.append("")
-            lines.append("Остались: %s" % preview)
+            self._note("не удалились: %s" % ", ".join("#%d" % v for v in failed[:100]))
 
-        builder = AlertDialogBuilder(activity)
-        builder.set_title("Готово" if not failed else "Готово с ошибками")
-        builder.set_message("\n".join(lines))
-        builder.set_positive_button("Ок", lambda b, w: b.dismiss())
-        builder.show()
+        self._set_status(
+            "Готово: удалено %d из %d%s"
+            % (deleted, total, (", ошибок %d" % len(failed)) if failed else "")
+        )
 
-    # ------------------------------------------------------------------
-    # Прогресс
-    # ------------------------------------------------------------------
-
-    def _show_progress(self, title, message, determinate=False):
-        def build():
-            fragment = get_last_fragment()
-            activity = fragment.getParentActivity() if fragment else None
-            if activity is None:
-                return
-            style = (
-                AlertDialogBuilder.ALERT_TYPE_LOADING
-                if determinate
-                else AlertDialogBuilder.ALERT_TYPE_SPINNER
-            )
-            builder = AlertDialogBuilder(activity, style)
-            builder.set_title(title)
-            builder.set_message(message)
-            builder.show()
-            try:
-                builder.set_cancelable(False)
-            except Exception:
-                pass
-            self._dialog = builder
-
-        run_on_ui_thread(build)
-
-    def _update_progress(self, title, message, percent=None):
-        def apply():
-            builder = self._dialog
-            if builder is None:
-                return
-            try:
-                builder.set_title(title)
-                builder.set_message(message)
-            except Exception:
-                pass
-            if percent is not None:
-                try:
-                    builder.set_progress(max(0, min(100, int(percent))))
-                except Exception:
-                    pass
-
-        run_on_ui_thread(apply)
-
-    def _dismiss_progress(self):
-        def close():
-            builder = self._dialog
-            self._dialog = None
-            if builder is None:
-                return
-            try:
-                builder.dismiss()
-            except Exception:
-                pass
-
-        run_on_ui_thread(close)
-
-    def _on_click(self, context=None):
-        threading.Thread(target=self._run, args=(context,), daemon=True).start()
-
-    def _run(self, context=None):
-        try:
-            limit = _parse_limit(self.get_setting("limit", DEFAULT_LIMIT))
-            layout = self._layout()
-            tab = self._tab(layout)
-            messages = self._messages(layout, tab)
-
-            total = None
-            if self.get_setting("show_total", True):
-                total = self._total_in_channel(self._dialog_id(layout, context), tab)
-
-            if messages and len(messages) < limit and self.get_setting("auto_load", True):
-                BulletinHelper.show_info("Докручиваю список, подождите")
-                messages = self._load_more(layout, tab, limit)
-
-            if not messages:
-                BulletinHelper.show_error(
-                    "На вкладке «%s» пока ничего не загружено" % TAB_NAMES.get(tab, tab)
-                )
-                return
-
-            # Выделение трогает вьюхи клиента, поэтому только на UI-потоке.
-            run_on_ui_thread(lambda: self._select(layout, tab, messages, limit, total))
-        except Exception as exception:
-            log("[select_all_files] ошибка подготовки:\n" + traceback.format_exc())
-            BulletinHelper.show_error("Не вышло: %s" % exception)
-
-    def _select(self, layout, tab, messages, limit, total=None):
-        try:
-            forced = bool(self.get_setting("force", False))
-            selected = None
-            entered = self._enter_selection(layout, tab, messages)
-
-            if not forced and entered:
-                selected = self._select_standard(layout, tab, messages, limit)
-
-            if selected is None:
-                selected = self._select_forced(layout, messages, limit)
-                if not forced:
-                    log(
-                        "[select_all_files] штатный путь не сработал (режим выделения: %s), "
-                        "ушли в прямую запись" % entered
-                    )
-
-            marked = self._selected_count(layout) or selected
-            log(
-                "[select_all_files] вкладка=%s загружено=%d выделено=%d отмечено=%d всего в канале=%s"
-                % (tab, len(messages), selected, marked, total)
-            )
-
-            if total:
-                left = max(total - marked, 0)
-                text = "Отмечено %d из %d · останется %d" % (marked, total, left)
+        def notify():
+            if failed:
+                BulletinHelper.show_error("Удалено %d, не вышло %d" % (deleted, len(failed)))
             else:
-                text = "Отмечено %d (загружено %d)" % (marked, len(messages))
+                BulletinHelper.show_success("Удалено постов: %d" % deleted)
 
-            if marked >= limit and (not total or total > marked):
-                text += " · лимит %d, повторите после удаления" % limit
+        run_on_ui_thread(notify)
 
-            BulletinHelper.show_success(text)
+    def _quiet_bulletin(self, text):
+        if self.get_setting("silent", False):
+            return
+        run_on_ui_thread(lambda: BulletinHelper.show_info(text))
+
+    # ------------------------------------------------------------------
+    # Ручное выделение (запасной путь)
+    # ------------------------------------------------------------------
+
+    def _tab(self, layout):
+        for method_name in ("getSelectedTab", "getClosestTab"):
+            method = _find_method(layout, method_name, 0)
+            if method is None:
+                continue
+            try:
+                return int(_invoke(method, layout, []))
+            except Exception:
+                continue
+        value = get_private_field(layout, "selectedTab")
+        try:
+            return int(value)
+        except Exception:
+            return 1
+
+    def _messages(self, layout, tab):
+        _, data = _first_field(layout, ("sharedMediaData",))
+        if data is None:
+            raise RuntimeError("не нашёл список медиа")
+        bucket = _array_get(data, tab)
+        if bucket is None:
+            raise RuntimeError("вкладка ещё не загружена")
+        messages = None
+        for field in ("messages", "messagesList"):
+            try:
+                messages = get_private_field(bucket, field)
+            except Exception:
+                messages = None
+            if messages is not None:
+                break
+        items = _as_list(messages)
+        if items is None:
+            raise RuntimeError("список сообщений не читается")
+        return items
+
+    def _selected_count(self, layout):
+        selected = get_private_field(layout, "selectedFiles")
+        if selected is None:
+            return 0
+        total = 0
+        for index in (0, 1):
+            bucket = _array_get(selected, index)
+            if bucket is None:
+                continue
+            size_method = _find_method(bucket, "size", 0)
+            if size_method is None:
+                continue
+            try:
+                total += int(_invoke(size_method, bucket, []))
+            except Exception:
+                continue
+        return total
+
+    def _on_select_click(self, context=None):
+        def work():
+            try:
+                layout = self._layout()
+                if layout is None:
+                    raise RuntimeError("откройте профиль канала и вкладку с медиа")
+                tab = self._tab(layout)
+                messages = self._messages(layout, tab)
+                if not messages:
+                    raise RuntimeError("на вкладке ничего не загружено")
+                run_on_ui_thread(lambda: self._select(layout, tab, messages))
+            except Exception as exception:
+                message = str(exception)
+                run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _select(self, layout, tab, messages):
+        try:
+            long_click = _find_method(layout, "onItemLongClick", 3)
+            item_click = _find_method(layout, "onItemClick", 5)
+            if long_click is None or item_click is None:
+                raise RuntimeError("клиент не даёт добраться до выделения")
+
+            _invoke(long_click, layout, [messages[0], None, Integer(int(tab))])
+            for index in range(1, min(len(messages), DELETE_CHUNK)):
+                try:
+                    _invoke(
+                        item_click,
+                        layout,
+                        [
+                            Integer(int(index)),
+                            None,
+                            messages[index],
+                            Integer(int(tab)),
+                            Integer(int(tab)),
+                        ],
+                    )
+                except Exception:
+                    continue
+
+            marked = self._selected_count(layout)
+            BulletinHelper.show_success(
+                "Отмечено %d на вкладке «%s»" % (marked, TAB_NAMES.get(tab, tab))
+            )
         except Exception as exception:
-            log("[select_all_files] ошибка выделения:\n" + traceback.format_exc())
+            log("[files_cleaner] выделение:\n" + traceback.format_exc())
             BulletinHelper.show_error("Не вышло: %s" % exception)
