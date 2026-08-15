@@ -306,17 +306,51 @@ def _peer_kind_id(peer):
 
 
 def _author_key(message):
-    """Кто написал пост: ('u', id) / ('c', id) / ('n', подпись) / ('?', None)."""
+    """Кто написал пост: ('n', подпись) / ('u', id) / ('c', id) / ('?', None).
+
+    Подпись под постом канала точнее from_id: там всегда сам канал.
+    """
+    signature = _field(message, "post_author")
+    if signature:
+        text = str(signature).strip()
+        if text:
+            return "n", text
+
     author = _peer_kind_id(_field(message, "from_id"))
     if author:
         return author
-    signature = _field(message, "post_author")
-    if signature:
-        return "n", str(signature)
+
     peer = _peer_kind_id(_field(message, "peer_id"))
     if peer:
         return peer
     return "?", None
+
+
+def _content_kind(message):
+    """Во что этот пост: файл, фото, видео, музыка, голосовое, GIF или текст."""
+    media = _field(message, "media")
+    if media is None or isinstance(media, TLRPC.TL_messageMediaEmpty):
+        return "Без вложений (текст)"
+    if isinstance(media, TLRPC.TL_messageMediaWebPage):
+        return "Ссылки с превью"
+    if isinstance(media, TLRPC.TL_messageMediaPhoto):
+        return "Фото"
+    if isinstance(media, TLRPC.TL_messageMediaDocument):
+        document = _field(media, "document")
+        attributes = _as_list(_field(document, "attributes")) or []
+        for attribute in attributes:
+            if isinstance(attribute, TLRPC.TL_documentAttributeAnimated):
+                return "GIF"
+            if isinstance(attribute, TLRPC.TL_documentAttributeSticker):
+                return "Стикеры"
+            if isinstance(attribute, TLRPC.TL_documentAttributeVideo):
+                return "Видео"
+            if isinstance(attribute, TLRPC.TL_documentAttributeAudio):
+                if _field(attribute, "voice"):
+                    return "Голосовые"
+                return "Музыка"
+        return "Файлы (документы)"
+    return "Прочие вложения"
 
 
 def _has_document(message):
@@ -869,8 +903,10 @@ class FilesCleanerPlugin(BasePlugin):
         return request
 
     def _collect_authors(self, dialog_id, keep_ids):
-        """Все посты подряд, разложенные по авторам."""
+        """Все посты подряд: по авторам, по содержимому и по источникам пересылки."""
         authors = {}
+        kinds = {}
+        sources = {}
         seen = set()
         offset_id = 0
         total = 0
@@ -921,6 +957,15 @@ class FilesCleanerPlugin(BasePlugin):
                 if _has_media(message):
                     bucket["media"] += 1
 
+                kind = _content_kind(message)
+                kinds.setdefault(kind, []).append(message_id)
+
+                forward = _field(message, "fwd_from")
+                if forward is not None:
+                    origin = _source_channel(message)
+                    if origin:
+                        sources.setdefault(origin, []).append(message_id)
+
             self._set_status("Читаю историю: %d постов, авторов %d" % (total, len(authors)))
 
             if len(messages) < PAGE_LIMIT:
@@ -930,12 +975,12 @@ class FilesCleanerPlugin(BasePlugin):
             offset_id = lowest
             time.sleep(PAGE_PAUSE)
 
-        return authors, total
+        return authors, kinds, sources, total
 
     def _author_title(self, key):
         kind, value = key
         if kind == "n":
-            return "Подпись: %s" % value
+            return str(value)
         if kind == "?":
             return "Без автора"
 
@@ -979,7 +1024,7 @@ class FilesCleanerPlugin(BasePlugin):
             self._set_status("Читаю историю…")
             self._quiet_bulletin("Читаю историю, прогресс в настройках")
 
-            authors, total = self._collect_authors(dialog_id, keep_ids)
+            authors, kinds, sources, total = self._collect_authors(dialog_id, keep_ids)
             if not authors:
                 self._busy = False
                 self._set_status("Постов не нашлось")
@@ -988,17 +1033,33 @@ class FilesCleanerPlugin(BasePlugin):
 
             ranked = sorted(authors.items(), key=lambda item: -len(item[1]["ids"]))
             self._note("всего постов %d, авторов %d" % (total, len(ranked)))
-            for key, bucket in ranked:
+
+            rows = []
+            for key, bucket in ranked[:40]:
+                title = self._author_title(key)
                 self._note(
-                    "%s — постов %d, из них с файлами %d, с любым вложением %d"
-                    % (self._author_title(key), len(bucket["ids"]), bucket["files"], bucket["media"])
+                    "автор %s — постов %d, файлов %d, с вложением %d"
+                    % (title, len(bucket["ids"]), bucket["files"], bucket["media"])
+                )
+                rows.append(("👤 " + title, bucket["ids"], bucket))
+
+            if len(ranked) < 2:
+                self._note(
+                    "автор один: у постов нет подписи автора — она пишется в пост "
+                    "только при включённых подписях и только с момента включения"
                 )
 
+            for kind in sorted(kinds, key=lambda k: -len(kinds[k])):
+                self._note("тип «%s» — %d" % (kind, len(kinds[kind])))
+                rows.append(("📦 %s" % kind, kinds[kind], None))
+
+            for origin in sorted(sources, key=lambda k: -len(sources[k])):
+                title = self._author_title(("c", origin))
+                self._note("переслано из %s — %d" % (title, len(sources[origin])))
+                rows.append(("↪️ Переслано: %s" % title, sources[origin], None))
+
             self._busy = False
-            self._set_status("Авторов: %d, постов: %d" % (len(ranked), total))
-            rows = [
-                (self._author_title(key), bucket) for key, bucket in ranked[:40]
-            ]
+            self._set_status("Постов %d, авторов %d" % (total, len(ranked)))
             run_on_ui_thread(lambda: self._show_authors(dialog_id, rows, total))
         except Exception as exception:
             message = str(exception)
@@ -1014,16 +1075,18 @@ class FilesCleanerPlugin(BasePlugin):
             BulletinHelper.show_info("Авторов: %d" % len(rows))
             return
 
-        items = [
-            "%s — %d постов (файлов %d)" % (title, len(bucket["ids"]), bucket["files"])
-            for title, bucket in rows
-        ]
+        items = []
+        for title, ids, bucket in rows:
+            if bucket is not None:
+                items.append("%s — %d постов (файлов %d)" % (title, len(ids), bucket["files"]))
+            else:
+                items.append("%s — %d постов" % (title, len(ids)))
 
         def on_pick(builder, index):
             builder.dismiss()
             if 0 <= index < len(rows):
-                title, bucket = rows[index]
-                self._confirm_author(dialog_id, title, bucket)
+                title, ids, bucket = rows[index]
+                self._confirm_group(dialog_id, title, ids, bucket)
 
         builder = AlertDialogBuilder(activity)
         builder.set_title("Постов всего: %d" % total)
@@ -1033,23 +1096,29 @@ class FilesCleanerPlugin(BasePlugin):
         builder.create()
         builder.show()
 
-    def _confirm_author(self, dialog_id, title, bucket):
+    def _confirm_group(self, dialog_id, title, group_ids, bucket=None):
         fragment = get_last_fragment()
         activity = fragment.getParentActivity() if fragment else None
         if activity is None:
             return
 
-        ids = sorted(bucket["ids"])
+        ids = sorted(group_ids)
         preview = ", ".join("#%d" % value for value in ids[:12])
         if len(ids) > 12:
             preview += " …"
 
+        details = "Всего постов: %d" % len(ids)
+        if bucket is not None:
+            details += "\nИз них с файлами: %d, с любым вложением: %d" % (
+                bucket["files"],
+                bucket["media"],
+            )
+
         builder = AlertDialogBuilder(activity)
         builder.set_title("Удалить %d постов?" % len(ids))
         builder.set_message(
-            "Автор: %s\n\nВсего постов: %d\nИз них с файлами: %d, с любым вложением: %d\n\n%s\n\n"
-            "Удаляются все посты этого автора, не только с файлами. Необратимо."
-            % (title, len(ids), bucket["files"], bucket["media"], preview)
+            "%s\n\n%s\n\n%s\n\nУдаляется вся группа целиком. Необратимо."
+            % (title, details, preview)
         )
         builder.set_positive_button(
             "Удалить в фоне",
