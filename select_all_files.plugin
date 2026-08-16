@@ -52,6 +52,12 @@ MAX_PAGES = 500
 REQUEST_TIMEOUT = 45.0
 MAX_LOG_LINES = 400
 REPORT_CHUNK = 3800
+EDIT_PAUSE = 1.2
+
+# Флаги messages.editMessage: message=flags.11, entities=flags.3, media=flags.14.
+EDIT_FLAG_MESSAGE = 1 << 11
+EDIT_FLAG_ENTITIES = 1 << 3
+EDIT_FLAG_MEDIA = 1 << 14
 
 TAB_NAMES = {0: "Медиа", 1: "Файлы", 2: "Голосовые", 3: "Ссылки", 4: "Музыка", 5: "GIF"}
 
@@ -528,6 +534,12 @@ class FilesCleanerPlugin(BasePlugin):
                 self._on_forwarded_click,
             ),
             (
+                "Заменить файлы на картинку",
+                "msg_photo_settings",
+                "Файл убрать, подпись сохранить",
+                self._on_replace_click,
+            ),
+            (
                 "Кто сколько постил",
                 "msg_stats",
                 "Авторы, счётчики и удаление по автору",
@@ -541,6 +553,22 @@ class FilesCleanerPlugin(BasePlugin):
             ),
             ("Выделить все", "msg_select", "Отметить открытую вкладку", self._on_select_click),
         )
+        try:
+            item_id = self.add_menu_item(
+                MenuItemData(
+                    menu_type=MenuItemType.MESSAGE_CONTEXT_MENU,
+                    text="Заглушка для замены",
+                    icon="msg_photo_settings",
+                    subtext="Запомнить эту картинку",
+                    on_click=self._on_pick_placeholder,
+                    priority=8,
+                )
+            )
+            if item_id:
+                self._items.append(item_id)
+        except Exception:
+            log("[files_cleaner] пункт заглушки не добавлен:\n" + traceback.format_exc())
+
         for menu_type in (MenuItemType.PROFILE_ACTION_MENU, MenuItemType.CHAT_ACTION_MENU):
             for text, icon, subtext, handler in entries:
                 try:
@@ -628,6 +656,13 @@ class FilesCleanerPlugin(BasePlugin):
     # Настройки
     # ------------------------------------------------------------------
 
+    def _placeholder_status(self):
+        chat = self.get_setting("placeholder_chat", "")
+        message = self.get_setting("placeholder_msg", "")
+        if chat and message:
+            return "Картинка выбрана: чат %s, пост %s" % (chat, message)
+        return "Картинка не выбрана — зажмите сообщение с ней"
+
     def _log_page(self):
         items = [Header(text="Лог")]
         lines = self._logs[-120:] if self._logs else ["Пусто"]
@@ -659,6 +694,21 @@ class FilesCleanerPlugin(BasePlugin):
             Text(text="Лог в «Избранное»", icon="msg_saved", on_click=self._logs_to_saved),
             Text(text="Очистить лог", icon="msg_clear", on_click=self._clear_logs),
             Divider(),
+            Header(text="Замена файлов на картинку"),
+            Text(
+                text="Заменить файлы на картинку",
+                subtext=self._placeholder_status(),
+                icon="msg_photo_settings",
+                accent=True,
+                on_click=lambda view=None: self._on_replace_click({}),
+            ),
+            Divider(
+                text=(
+                    "Сначала зажмите в Telegram сообщение с нужной картинкой и выберите "
+                    "«Заглушка для замены». Потом здесь или в меню канала запускайте замену: "
+                    "файл уйдёт, подпись со всем форматированием останется."
+                )
+            ),
             Header(text="Удаление"),
             Text(
                 text="Удалить все файлы",
@@ -1202,6 +1252,295 @@ class FilesCleanerPlugin(BasePlugin):
         builder.set_neutral_button("Список в лог", lambda b, w: (b.dismiss(), self._copy_logs()))
         builder.create()
         builder.show()
+
+    # ------------------------------------------------------------------
+    # Замена файлов на картинку-заглушку
+    # ------------------------------------------------------------------
+
+    def _on_pick_placeholder(self, context=None):
+        try:
+            message = (context or {}).get("message")
+        except Exception:
+            message = None
+        if message is None:
+            BulletinHelper.show_error("Не понял, какое это сообщение")
+            return
+
+        message_id = _call(message, "getId")
+        dialog_id = _call(message, "getDialogId")
+        if message_id is None or dialog_id is None:
+            BulletinHelper.show_error("Не смог прочитать сообщение")
+            return
+
+        self.set_setting("placeholder_chat", str(int(dialog_id)))
+        self.set_setting("placeholder_msg", str(int(message_id)), reload_settings=True)
+        self._note("заглушка: чат %s, сообщение %s" % (dialog_id, message_id))
+        BulletinHelper.show_success("Картинка запомнена как заглушка")
+
+    def _placeholder_request(self, dialog_id, message_id):
+        controller = get_messages_controller()
+        peer = controller.getInputPeer(dialog_id)
+        if isinstance(peer, TLRPC.TL_inputPeerChannel):
+            request = TLRPC.TL_channels_getMessages()
+            channel = TLRPC.TL_inputChannel()
+            channel.channel_id = peer.channel_id
+            channel.access_hash = peer.access_hash
+            request.channel = channel
+        else:
+            request = TLRPC.TL_messages_getMessages()
+        item = TLRPC.TL_inputMessageID()
+        item.id = int(message_id)
+        request.id.add(item)
+        return request
+
+    def _fetch_placeholder(self):
+        """Свежая ссылка на картинку: file_reference живёт недолго."""
+        chat_raw = self.get_setting("placeholder_chat", "")
+        message_raw = self.get_setting("placeholder_msg", "")
+        if not chat_raw or not message_raw:
+            raise RuntimeError(
+                "картинка не выбрана: зажмите сообщение с ней → «Заглушка для замены»"
+            )
+
+        dialog_id = _normalize_dialog(chat_raw)
+        message_id = int(str(message_raw).strip())
+
+        response, error = self._request_retrying(
+            self._placeholder_request(dialog_id, message_id)
+        )
+        if error is not None:
+            raise RuntimeError("картинку не достать: %s" % _error_text(error))
+
+        messages = _messages_of(response)
+        if not messages:
+            raise RuntimeError("сообщение с картинкой не найдено — выберите заново")
+
+        media = _field(messages[0], "media")
+        photo = _field(media, "photo")
+        if photo is None:
+            raise RuntimeError("в выбранном сообщении нет фото")
+
+        input_photo = TLRPC.TL_inputPhoto()
+        input_photo.id = _field(photo, "id")
+        input_photo.access_hash = _field(photo, "access_hash")
+        input_photo.file_reference = _field(photo, "file_reference")
+
+        input_media = TLRPC.TL_inputMediaPhoto()
+        input_media.id = input_photo
+        return input_media
+
+    def _edit_request(self, dialog_id, message, input_media):
+        """Меняем медиа, подпись и её разметку оставляем как были."""
+        request = TLRPC.TL_messages_editMessage()
+        request.peer = get_messages_controller().getInputPeer(dialog_id)
+        request.id = int(_message_id(message))
+        request.media = input_media
+
+        flags = EDIT_FLAG_MEDIA
+        caption = _field(message, "message")
+        request.message = str(caption) if caption else ""
+        flags |= EDIT_FLAG_MESSAGE
+
+        entities = _as_list(_field(message, "entities")) or []
+        if entities:
+            holder = ArrayList()
+            for entity in entities:
+                holder.add(entity)
+            request.entities = holder
+            flags |= EDIT_FLAG_ENTITIES
+
+        request.flags = flags
+        return request, len(entities)
+
+    def _collect_documents(self, dialog_id, target, keep_ids):
+        """Посты с вложениями вместе с самими объектами — нужна подпись."""
+        items = []
+        seen = set()
+        offset_id = 0
+
+        for _ in range(MAX_PAGES):
+            if self._stop:
+                self._note("сбор прерван вручную")
+                break
+
+            response, error = self._request_retrying(
+                self._search_page(dialog_id, target, offset_id)
+            )
+            if error is not None:
+                raise RuntimeError("поиск не прошёл: %s" % _error_text(error))
+            if response is None:
+                break
+
+            messages = _messages_of(response)
+            if messages is None:
+                self._note("страница не прочиталась (%s)" % _class_name(response))
+                break
+            if not messages:
+                break
+
+            lowest = offset_id
+            for message in messages:
+                message_id = _message_id(message)
+                if message_id is None:
+                    continue
+                if lowest == 0 or message_id < lowest:
+                    lowest = message_id
+                if message_id in seen or message_id in keep_ids:
+                    continue
+                seen.add(message_id)
+                items.append(message)
+
+            self._set_status("Собираю список: найдено %d" % len(items))
+
+            if len(messages) < PAGE_LIMIT:
+                break
+            if lowest <= 1 or (offset_id > 0 and lowest >= offset_id):
+                break
+            offset_id = lowest
+            time.sleep(PAGE_PAUSE)
+
+        items.sort(key=lambda item: _message_id(item) or 0)
+        return items
+
+    def _on_replace_click(self, context=None):
+        if self._busy:
+            BulletinHelper.show_info("Уже работаю, прогресс в настройках")
+            return
+        dialog_id = self._dialog_id(context)
+        if not dialog_id:
+            BulletinHelper.show_error("Не понял, какой это канал — откройте его")
+            return
+        self._busy = True
+        self._stop = False
+        threading.Thread(target=self._replace_job, args=(dialog_id,), daemon=True).start()
+
+    def _replace_job(self, dialog_id):
+        try:
+            target = int(self.get_setting("target", TARGET_FILES) or 0)
+            keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
+
+            self._set_status("Проверяю картинку…")
+            input_media = self._fetch_placeholder()
+            self._note("картинка-заглушка получена")
+
+            self._set_status("Собираю посты…")
+            self._quiet_bulletin("Ищу посты с файлами, прогресс в настройках")
+            dialog_id, _ = self._resolve_dialog(dialog_id, target)
+            items = self._collect_documents(dialog_id, target, keep_ids)
+            self._note("постов с вложениями: %d" % len(items))
+
+            if not items:
+                self._busy = False
+                self._set_status("Заменять нечего")
+                run_on_ui_thread(lambda: BulletinHelper.show_info("Таких постов нет"))
+                return
+
+            with_caption = sum(1 for item in items if _field(item, "message"))
+            self._busy = False
+            self._set_status("Найдено %d — жду подтверждения" % len(items))
+            run_on_ui_thread(
+                lambda: self._confirm_replace(dialog_id, items, input_media, with_caption)
+            )
+        except Exception as exception:
+            message = str(exception)
+            self._note("замена сорвалась: %s" % message)
+            self._set_status("Ошибка: %s" % message)
+            self._busy = False
+            run_on_ui_thread(lambda: BulletinHelper.show_error("Не вышло: %s" % message))
+
+    def _confirm_replace(self, dialog_id, items, input_media, with_caption):
+        fragment = get_last_fragment()
+        activity = fragment.getParentActivity() if fragment else None
+        if activity is None:
+            self._set_status("Некуда показать подтверждение")
+            return
+
+        minutes = int(len(items) * EDIT_PAUSE / 60) + 1
+        builder = AlertDialogBuilder(activity)
+        builder.set_title("Заменить файлы в %d постах?" % len(items))
+        builder.set_message(
+            "Файл в каждом посте заменится на выбранную картинку.\n\n"
+            "Подпись сохраняется как есть: премиум-эмодзи, ссылки, скрытые ссылки "
+            "в тексте и всё остальное форматирование.\n\n"
+            "Постов с подписью: %d из %d\n"
+            "Займёт примерно %d мин — Telegram ограничивает частоту правок.\n\n"
+            "Сами файлы после замены из постов исчезнут."
+            % (with_caption, len(items), minutes)
+        )
+        builder.set_positive_button(
+            "Заменить в фоне",
+            lambda b, w: (b.dismiss(), self._start_replace(dialog_id, items, input_media)),
+        )
+        builder.set_negative_button("Отмена", lambda b, w: b.dismiss())
+        builder.create()
+        builder.show()
+
+    def _start_replace(self, dialog_id, items, input_media):
+        self._busy = True
+        self._stop = False
+        self._quiet_bulletin("Меняю файлы на картинку — прогресс в настройках")
+        threading.Thread(
+            target=self._replace_worker,
+            args=(dialog_id, items, input_media),
+            daemon=True,
+        ).start()
+
+    def _replace_worker(self, dialog_id, items, input_media):
+        done = 0
+        failed = []
+        total = len(items)
+
+        for index, message in enumerate(items):
+            if self._stop:
+                self._note("замена остановлена на %d из %d" % (done, total))
+                break
+
+            message_id = _message_id(message)
+            try:
+                request, entity_count = self._edit_request(dialog_id, message, input_media)
+                response, error = self._request_retrying(request)
+                if error is not None:
+                    text = _error_text(error)
+                    failed.append(message_id)
+                    self._note("пост #%s не заменён: %s" % (message_id, text))
+                    if "FILE_REFERENCE" in (text or ""):
+                        try:
+                            input_media = self._fetch_placeholder()
+                            self._note("обновил ссылку на картинку, продолжаю")
+                        except Exception as refresh_error:
+                            self._note("картинку обновить не вышло: %s" % refresh_error)
+                            break
+                else:
+                    done += 1
+                    if done == 1:
+                        self._note(
+                            "первый пост заменён, разметки в подписи: %d" % entity_count
+                        )
+            except Exception as exception:
+                failed.append(message_id)
+                self._note("пост #%s сорвался: %s" % (message_id, exception))
+
+            self._set_status(
+                "Заменено %d из %d · осталось %d · ошибок %d"
+                % (done, total, total - done - len(failed), len(failed))
+            )
+            if index + 1 < total:
+                time.sleep(EDIT_PAUSE)
+
+        self._busy = False
+        self._note("замена завершена: %d из %d, ошибок %d" % (done, total, len(failed)))
+        self._set_status(
+            "Готово: заменено %d из %d%s"
+            % (done, total, (", ошибок %d" % len(failed)) if failed else "")
+        )
+
+        def notify():
+            if failed:
+                BulletinHelper.show_error("Заменено %d, не вышло %d" % (done, len(failed)))
+            else:
+                BulletinHelper.show_success("Заменено постов: %d" % done)
+
+        run_on_ui_thread(notify)
 
     # ------------------------------------------------------------------
     # Оставить только избранных авторов
