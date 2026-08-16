@@ -523,6 +523,7 @@ class FilesCleanerPlugin(BasePlugin):
         self._busy = False
         self._stop = False
         self._logs = []
+        self._placeholder = None
         self._status = self.get_setting("status_line", "Ничего не запускалось")
 
         entries = (
@@ -1272,26 +1273,40 @@ class FilesCleanerPlugin(BasePlugin):
             BulletinHelper.show_error("Не смог прочитать сообщение")
             return
 
+        photo = self._photo_of(message)
+        if photo is None:
+            self._note("в выбранном сообщении нет фото")
+            BulletinHelper.show_error("Тут нет фото — выберите сообщение с картинкой")
+            return
+
+        # Держим готовую ссылку под рукой, чтобы не перезапрашивать её сразу же.
+        self._placeholder = self._media_from_photo(photo)
         self.set_setting("placeholder_chat", str(int(dialog_id)))
         self.set_setting("placeholder_msg", str(int(message_id)), reload_settings=True)
         self._note("заглушка: чат %s, сообщение %s" % (dialog_id, message_id))
         BulletinHelper.show_success("Картинка запомнена как заглушка")
 
-    def _placeholder_request(self, dialog_id, message_id):
-        controller = get_messages_controller()
-        peer = controller.getInputPeer(dialog_id)
-        if isinstance(peer, TLRPC.TL_inputPeerChannel):
-            request = TLRPC.TL_channels_getMessages()
-            channel = TLRPC.TL_inputChannel()
-            channel.channel_id = peer.channel_id
-            channel.access_hash = peer.access_hash
-            request.channel = channel
-        else:
-            request = TLRPC.TL_messages_getMessages()
-        item = TLRPC.TL_inputMessageID()
-        item.id = int(message_id)
-        request.id.add(item)
-        return request
+    def _media_from_photo(self, photo):
+        if photo is None:
+            return None
+        input_photo = TLRPC.TL_inputPhoto()
+        input_photo.id = _field(photo, "id")
+        input_photo.access_hash = _field(photo, "access_hash")
+        input_photo.file_reference = _field(photo, "file_reference")
+
+        input_media = TLRPC.TL_inputMediaPhoto()
+        input_media.id = input_photo
+        return input_media
+
+    def _photo_of(self, message):
+        """TLRPC.Photo из сообщения, каким бы объектом оно ни было."""
+        owner = _field(message, "messageOwner")
+        for holder in (owner, message):
+            media = _field(holder, "media")
+            photo = _field(media, "photo")
+            if photo is not None:
+                return photo
+        return None
 
     def _fetch_placeholder(self):
         """Свежая ссылка на картинку: file_reference живёт недолго."""
@@ -1302,32 +1317,32 @@ class FilesCleanerPlugin(BasePlugin):
                 "картинка не выбрана: зажмите сообщение с ней → «Заглушка для замены»"
             )
 
-        dialog_id = _normalize_dialog(chat_raw)
+        # Идентификатор берётся как есть: у личных чатов он положительный.
+        dialog_id = int(str(chat_raw).strip())
         message_id = int(str(message_raw).strip())
 
-        response, error = self._request_retrying(
-            self._placeholder_request(dialog_id, message_id)
-        )
+        # Сообщение достаём через историю: одна позиция сразу за нужной.
+        request = self._history_page(dialog_id, message_id + 1)
+        request.limit = 1
+        response, error = self._request_retrying(request)
         if error is not None:
             raise RuntimeError("картинку не достать: %s" % _error_text(error))
 
-        messages = _messages_of(response)
-        if not messages:
+        messages = _messages_of(response) or []
+        picked = None
+        for message in messages:
+            if _message_id(message) == message_id:
+                picked = message
+                break
+        if picked is None and messages:
+            picked = messages[0]
+        if picked is None:
             raise RuntimeError("сообщение с картинкой не найдено — выберите заново")
 
-        media = _field(messages[0], "media")
-        photo = _field(media, "photo")
-        if photo is None:
+        media = self._media_from_photo(self._photo_of(picked))
+        if media is None:
             raise RuntimeError("в выбранном сообщении нет фото")
-
-        input_photo = TLRPC.TL_inputPhoto()
-        input_photo.id = _field(photo, "id")
-        input_photo.access_hash = _field(photo, "access_hash")
-        input_photo.file_reference = _field(photo, "file_reference")
-
-        input_media = TLRPC.TL_inputMediaPhoto()
-        input_media.id = input_photo
-        return input_media
+        return media
 
     def _edit_request(self, dialog_id, message, input_media):
         """Меняем медиа, подпись и её разметку оставляем как были."""
@@ -1420,8 +1435,12 @@ class FilesCleanerPlugin(BasePlugin):
             keep_ids = _parse_ids(self.get_setting("keep_ids", KEEP_DEFAULT))
 
             self._set_status("Проверяю картинку…")
-            input_media = self._fetch_placeholder()
-            self._note("картинка-заглушка получена")
+            input_media = self._placeholder
+            if input_media is None:
+                input_media = self._fetch_placeholder()
+                self._note("картинка-заглушка получена из чата")
+            else:
+                self._note("использую картинку, выбранную в этой сессии")
 
             self._set_status("Собираю посты…")
             self._quiet_bulletin("Ищу посты с файлами, прогресс в настройках")
@@ -1506,6 +1525,7 @@ class FilesCleanerPlugin(BasePlugin):
                     if "FILE_REFERENCE" in (text or ""):
                         try:
                             input_media = self._fetch_placeholder()
+                            self._placeholder = input_media
                             self._note("обновил ссылку на картинку, продолжаю")
                         except Exception as refresh_error:
                             self._note("картинку обновить не вышло: %s" % refresh_error)
