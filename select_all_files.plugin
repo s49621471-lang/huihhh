@@ -53,6 +53,7 @@ REQUEST_TIMEOUT = 45.0
 MAX_LOG_LINES = 400
 REPORT_CHUNK = 3800
 EDIT_PAUSE = 1.2
+EDIT_TIMEOUT = 120.0
 
 # Флаги messages.editMessage: message=flags.11, entities=flags.3, media=flags.14.
 EDIT_FLAG_MESSAGE = 1 << 11
@@ -524,6 +525,7 @@ class FilesCleanerPlugin(BasePlugin):
         self._stop = False
         self._logs = []
         self._placeholder = None
+        self._placeholder_doc = None
         self._status = self.get_setting("status_line", "Ничего не запускалось")
 
         entries = (
@@ -658,11 +660,18 @@ class FilesCleanerPlugin(BasePlugin):
     # ------------------------------------------------------------------
 
     def _placeholder_status(self):
-        chat = self.get_setting("placeholder_chat", "")
-        message = self.get_setting("placeholder_msg", "")
-        if chat and message:
-            return "Картинка выбрана: чат %s, пост %s" % (chat, message)
-        return "Картинка не выбрана — зажмите сообщение с ней"
+        photo = self.get_setting("placeholder_msg", "")
+        document = self.get_setting("placeholder_doc_msg", "")
+        if photo and document:
+            return "Готово: картинка (пост %s) и файл для альбомов (пост %s)" % (
+                photo,
+                document,
+            )
+        if photo:
+            return "Картинка выбрана (пост %s). Для альбомов пометьте её же файлом" % photo
+        if document:
+            return "Выбран только файл (пост %s) — пометьте ещё обычную картинку" % document
+        return "Ничего не выбрано — зажмите сообщение с картинкой"
 
     def _log_page(self):
         items = [Header(text="Лог")]
@@ -878,10 +887,10 @@ class FilesCleanerPlugin(BasePlugin):
             raise RuntimeError("Telegram не ответил за %d с" % int(timeout))
         return box.get("response"), box.get("error")
 
-    def _request_retrying(self, request, attempts=3):
+    def _request_retrying(self, request, attempts=3, timeout=REQUEST_TIMEOUT):
         last = None
         for _ in range(attempts):
-            response, error = self._request(request)
+            response, error = self._request(request, timeout)
             if error is None:
                 return response, None
             wait = _flood_wait(error)
@@ -1274,17 +1283,48 @@ class FilesCleanerPlugin(BasePlugin):
             return
 
         photo = self._photo_of(message)
-        if photo is None:
-            self._note("в выбранном сообщении нет фото")
-            BulletinHelper.show_error("Тут нет фото — выберите сообщение с картинкой")
+        document = self._document_of(message)
+
+        # Держим готовые ссылки под рукой, чтобы не перезапрашивать их сразу же.
+        if photo is not None:
+            self._placeholder = self._media_from_photo(photo)
+            self.set_setting("placeholder_chat", str(int(dialog_id)))
+            self.set_setting("placeholder_msg", str(int(message_id)), reload_settings=True)
+            self._note("заглушка-фото: чат %s, сообщение %s" % (dialog_id, message_id))
+            BulletinHelper.show_success("Картинка запомнена как заглушка")
             return
 
-        # Держим готовую ссылку под рукой, чтобы не перезапрашивать её сразу же.
-        self._placeholder = self._media_from_photo(photo)
-        self.set_setting("placeholder_chat", str(int(dialog_id)))
-        self.set_setting("placeholder_msg", str(int(message_id)), reload_settings=True)
-        self._note("заглушка: чат %s, сообщение %s" % (dialog_id, message_id))
-        BulletinHelper.show_success("Картинка запомнена как заглушка")
+        if document is not None:
+            self._placeholder_doc = self._media_from_document(document)
+            self.set_setting("placeholder_doc_chat", str(int(dialog_id)))
+            self.set_setting("placeholder_doc_msg", str(int(message_id)), reload_settings=True)
+            self._note("заглушка-файл: чат %s, сообщение %s" % (dialog_id, message_id))
+            BulletinHelper.show_success("Файл запомнен — им заменю посты в альбомах")
+            return
+
+        self._note("в выбранном сообщении нет ни фото, ни файла")
+        BulletinHelper.show_error("Тут нет картинки — выберите сообщение с ней")
+
+    def _media_from_document(self, document):
+        if document is None:
+            return None
+        input_document = TLRPC.TL_inputDocument()
+        input_document.id = _field(document, "id")
+        input_document.access_hash = _field(document, "access_hash")
+        input_document.file_reference = _field(document, "file_reference")
+
+        input_media = TLRPC.TL_inputMediaDocument()
+        input_media.id = input_document
+        return input_media
+
+    def _document_of(self, message):
+        owner = _field(message, "messageOwner")
+        for holder in (owner, message):
+            media = _field(holder, "media")
+            document = _field(media, "document")
+            if document is not None:
+                return document
+        return None
 
     def _media_from_photo(self, photo):
         if photo is None:
@@ -1308,14 +1348,22 @@ class FilesCleanerPlugin(BasePlugin):
                 return photo
         return None
 
-    def _fetch_placeholder(self):
-        """Свежая ссылка на картинку: file_reference живёт недолго."""
-        chat_raw = self.get_setting("placeholder_chat", "")
-        message_raw = self.get_setting("placeholder_msg", "")
-        if not chat_raw or not message_raw:
-            raise RuntimeError(
-                "картинка не выбрана: зажмите сообщение с ней → «Заглушка для замены»"
-            )
+    def _fetch_placeholder(self, as_document=False):
+        """Свежая ссылка на заглушку: file_reference живёт недолго."""
+        if as_document:
+            chat_raw = self.get_setting("placeholder_doc_chat", "")
+            message_raw = self.get_setting("placeholder_doc_msg", "")
+            if not chat_raw or not message_raw:
+                raise RuntimeError(
+                    "заглушка-файл не выбрана: отправьте картинку файлом и пометьте её"
+                )
+        else:
+            chat_raw = self.get_setting("placeholder_chat", "")
+            message_raw = self.get_setting("placeholder_msg", "")
+            if not chat_raw or not message_raw:
+                raise RuntimeError(
+                    "картинка не выбрана: зажмите сообщение с ней → «Заглушка для замены»"
+                )
 
         # Идентификатор берётся как есть: у личных чатов он положительный.
         dialog_id = int(str(chat_raw).strip())
@@ -1339,9 +1387,14 @@ class FilesCleanerPlugin(BasePlugin):
         if picked is None:
             raise RuntimeError("сообщение с картинкой не найдено — выберите заново")
 
-        media = self._media_from_photo(self._photo_of(picked))
-        if media is None:
-            raise RuntimeError("в выбранном сообщении нет фото")
+        if as_document:
+            media = self._media_from_document(self._document_of(picked))
+            if media is None:
+                raise RuntimeError("в помеченном сообщении нет файла")
+        else:
+            media = self._media_from_photo(self._photo_of(picked))
+            if media is None:
+                raise RuntimeError("в выбранном сообщении нет фото")
         return media
 
     def _edit_request(self, dialog_id, message, input_media):
@@ -1442,6 +1495,13 @@ class FilesCleanerPlugin(BasePlugin):
             else:
                 self._note("использую картинку, выбранную в этой сессии")
 
+            if self._placeholder_doc is None and self.get_setting("placeholder_doc_msg", ""):
+                try:
+                    self._placeholder_doc = self._fetch_placeholder(True)
+                    self._note("заглушка-файл для альбомов получена")
+                except Exception as doc_error:
+                    self._note("заглушку-файл достать не вышло: %s" % doc_error)
+
             self._set_status("Собираю посты…")
             self._quiet_bulletin("Ищу посты с файлами, прогресс в настройках")
             dialog_id, _ = self._resolve_dialog(dialog_id, target)
@@ -1504,9 +1564,22 @@ class FilesCleanerPlugin(BasePlugin):
             daemon=True,
         ).start()
 
+    def _try_edit(self, dialog_id, message, media):
+        """Одна попытка правки. Возвращает (успех, текст ошибки, число сущностей)."""
+        request, entity_count = self._edit_request(dialog_id, message, media)
+        try:
+            response, error = self._request_retrying(request, timeout=EDIT_TIMEOUT)
+        except Exception as exception:
+            return False, str(exception), entity_count
+        if error is None:
+            return True, None, entity_count
+        return False, _error_text(error), entity_count
+
     def _replace_worker(self, dialog_id, items, input_media):
         done = 0
         failed = []
+        reasons = {}
+        albums = 0
         total = len(items)
 
         for index, message in enumerate(items):
@@ -1515,27 +1588,61 @@ class FilesCleanerPlugin(BasePlugin):
                 break
 
             message_id = _message_id(message)
+            grouped = _field(message, "grouped_id")
+
+            # В альбоме фото вместо файла ломает группу — там сразу пробуем файл.
+            order = []
+            if grouped and self._placeholder_doc is not None:
+                albums += 1
+                order = [(self._placeholder_doc, "файл"), (input_media, "фото")]
+            else:
+                order = [(input_media, "фото"), (self._placeholder_doc, "файл")]
+
+            success = False
+            last_error = None
             try:
-                request, entity_count = self._edit_request(dialog_id, message, input_media)
-                response, error = self._request_retrying(request)
-                if error is not None:
-                    text = _error_text(error)
-                    failed.append(message_id)
-                    self._note("пост #%s не заменён: %s" % (message_id, text))
-                    if "FILE_REFERENCE" in (text or ""):
+                for media, label in order:
+                    if media is None:
+                        continue
+                    success, last_error, entity_count = self._try_edit(
+                        dialog_id, message, media
+                    )
+                    if success:
+                        done += 1
+                        if done == 1:
+                            self._note(
+                                "первый пост заменён (%s), разметки в подписи: %d"
+                                % (label, entity_count)
+                            )
+                        break
+
+                    if "FILE_REFERENCE" in (last_error or ""):
                         try:
-                            input_media = self._fetch_placeholder()
-                            self._placeholder = input_media
-                            self._note("обновил ссылку на картинку, продолжаю")
+                            refreshed = self._fetch_placeholder(label == "файл")
+                            if label == "файл":
+                                self._placeholder_doc = refreshed
+                            else:
+                                input_media = refreshed
+                                self._placeholder = refreshed
+                            self._note("обновил ссылку на заглушку, повторяю")
+                            success, last_error, entity_count = self._try_edit(
+                                dialog_id, message, refreshed
+                            )
+                            if success:
+                                done += 1
+                                break
                         except Exception as refresh_error:
-                            self._note("картинку обновить не вышло: %s" % refresh_error)
-                            break
-                else:
-                    done += 1
-                    if done == 1:
-                        self._note(
-                            "первый пост заменён, разметки в подписи: %d" % entity_count
-                        )
+                            self._note("заглушку обновить не вышло: %s" % refresh_error)
+
+                if not success:
+                    failed.append(message_id)
+                    code = (last_error or "неизвестно").split("_")[0:3]
+                    key = "_".join(code) if code else "неизвестно"
+                    reasons[key] = reasons.get(key, 0) + 1
+                    self._note(
+                        "пост #%s не заменён: %s%s"
+                        % (message_id, last_error, " (альбом)" if grouped else "")
+                    )
             except Exception as exception:
                 failed.append(message_id)
                 self._note("пост #%s сорвался: %s" % (message_id, exception))
@@ -1546,6 +1653,16 @@ class FilesCleanerPlugin(BasePlugin):
             )
             if index + 1 < total:
                 time.sleep(EDIT_PAUSE)
+
+        if albums:
+            self._note("постов в альбомах: %d" % albums)
+        for key in sorted(reasons, key=lambda k: -reasons[k]):
+            self._note("причина «%s» — %d постов" % (key, reasons[key]))
+        if reasons and self._placeholder_doc is None:
+            self._note(
+                "для постов в альбомах нужна заглушка-файл: отправьте ту же картинку "
+                "файлом (без сжатия) и пометьте её «Заглушка для замены»"
+            )
 
         self._busy = False
         self._note("замена завершена: %d из %d, ошибок %d" % (done, total, len(failed)))
